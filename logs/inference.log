@@ -1,0 +1,5 @@
+2026-05-30 19:53:05 [INFO] Загрузка checkpoint: /Users/Viachaslau_Kazakou/Work/LLM-learn/pytorch_llm/checkpoints/best_model.pt
+2026-05-30 19:53:05 [INFO] Используемое устройство: mps
+2026-05-30 19:53:05 [INFO] Модель загружена: 3,268,864 параметров
+2026-05-30 19:53:05 [INFO] Global step: 1400
+2026-05-30 19:53:05 [INFO] Best val loss: 2.0561195090413094

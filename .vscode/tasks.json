@@ -1,0 +1,231 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Install Dependencies (Poetry)",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"install"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Poetry Shell",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"shell"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Poetry Update",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"update"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Run FastAPI (Poetry)",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"run",
+				"uvicorn",
+				"app.main:app",
+				"--reload",
+				"--host",
+				"0.0.0.0",
+				"--port",
+				"8000"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": [],
+			"isBackground": true
+		},
+		{
+			"label": "Run Tests (Poetry)",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"run",
+				"pytest",
+				"-v"
+			],
+			"group": "test",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Format Code (Poetry)",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"run",
+				"black",
+				"app/",
+				"tests/"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Lint Code (Poetry)",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"run",
+				"flake8",
+				"app/",
+				"tests/"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Run Alembic Migration (Poetry)",
+			"type": "shell",
+			"command": "poetry",
+			"args": [
+				"run",
+				"alembic",
+				"upgrade",
+				"head"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Make Format",
+			"type": "shell",
+			"command": "zsh",
+			"args": [
+				"-lc",
+				"source /Users/Viachaslau_Kazakou/Work/learn-service/.venv/bin/activate && make format"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Make Lint",
+			"type": "shell",
+			"command": "zsh",
+			"args": [
+				"-lc",
+				"source /Users/Viachaslau_Kazakou/Work/learn-service/.venv/bin/activate && make lint"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Make Test",
+			"type": "shell",
+			"command": "zsh",
+			"args": [
+				"-lc",
+				"source /Users/Viachaslau_Kazakou/Work/learn-service/.venv/bin/activate && make test"
+			],
+			"group": "test"
+		},
+		{
+			"label": "Make Format (bash)",
+			"type": "shell",
+			"command": "/bin/bash",
+			"args": [
+				"-lc",
+				"source /Users/Viachaslau_Kazakou/Work/learn-service/.venv/bin/activate && make format"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Task Probe Write File",
+			"type": "shell",
+			"command": "/bin/bash",
+			"args": [
+				"-lc",
+				"echo ok-probe > /tmp/copilot_probe_task.txt && echo wrote"
+			],
+			"group": "build"
+		},
+		{
+			"label": "GCP Health Post Deploy Check",
+			"type": "shell",
+			"command": "zsh",
+			"args": [
+				"-lc",
+				"source /Users/Viachaslau_Kazakou/Work/learn-service/.venv/bin/activate && cd /Users/Viachaslau_Kazakou/Work/learn-service && make gcp-health"
+			]
+		},
+		{
+			"label": "GCP Health After SMTP Network Fix",
+			"type": "shell",
+			"command": "zsh",
+			"args": [
+				"-lc",
+				"source /Users/Viachaslau_Kazakou/Work/learn-service/.venv/bin/activate && cd /Users/Viachaslau_Kazakou/Work/learn-service && make gcp-health"
+			]
+		},
+		{
+			"label": "Pytest AI Chat Narrow",
+			"type": "shell",
+			"command": "zsh",
+			"args": [
+				"-lc",
+				"source /Users/Viachaslau_Kazakou/Work/learn-service/.venv/bin/activate && cd /Users/Viachaslau_Kazakou/Work/learn-service && pytest tests/test_ai_chat.py -q"
+			],
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}

@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "question": "Закончите уравнение: 2H₂ + O₂ → ?",
+      "solution": "2H₂ + O₂ → 2H₂O",
+      "answer": "2H₂O",
+      "category": "уравнения",
+      "difficulty": "easy"
+    },
+    {
+      "question": "Рассчитайте молярную массу H₂SO₄",
+      "solution": "M(H₂SO₄) = 2×1 + 32 + 4×16 = 2 + 32 + 64 = 98 г/моль",
+      "answer": "98 г/моль",
+      "category": "расчеты",
+      "difficulty": "easy"
+    },
+    {
+      "question": "Составьте уравнение реакции нейтрализации HCl и NaOH",
+      "solution": "HCl + NaOH → NaCl + H₂O",
+      "answer": "NaCl + H₂O",
+      "category": "уравнения",
+      "difficulty": "medium"
+    }
+  ]
+}

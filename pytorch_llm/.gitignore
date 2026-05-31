@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# PyTorch
+*.pt
+*.pth
+
+# Checkpoints
+checkpoints/
+*.ckpt
+
+# Data
+data/
+*.txt
+*.json
+
+# Logs
+logs/
+wandb/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Keep directories but ignore contents
+!data/.gitkeep
+!checkpoints/.gitkeep
+# Логи
+*.log
+logs/*.log

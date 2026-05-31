@@ -1,0 +1,213 @@
+import numpy as np
+
+# ══════════════════════════════════════════════════════════
+#  1. ДАННЫЕ
+# ══════════════════════════════════════════════════════════
+corpus = (
+    "кот сидел на коврике кот смотрел в окно кот прыгнул на стол "
+    "кот лежал на диване кот сидел на коврике кот смотрел в окно "
+    "кот прыгнул на стол кот лежал на диване кот сидел на стол "
+    "кот смотрел на коврике кот прыгнул в окно кот лежал на стол"
+)
+words = corpus.split()
+vocab = sorted(set(words))
+w2i   = {w: i for i, w in enumerate(vocab)}
+i2w   = {i: w for w, i in w2i.items()}
+V, D, T = len(vocab), 16, 4
+
+data = [w2i[w] for w in words]
+
+# ══════════════════════════════════════════════════════════
+#  2. ПАРАМЕТРЫ
+# ══════════════════════════════════════════════════════════
+rng = np.random.default_rng(42)
+scale = 0.01
+
+E  = rng.normal(0, scale, (V, D))
+Wq = rng.normal(0, scale, (D, D))
+Wk = rng.normal(0, scale, (D, D))
+Wv = rng.normal(0, scale, (D, D))
+Wo = rng.normal(0, scale, (D, V))
+
+# ══════════════════════════════════════════════════════════
+#  3. УТИЛИТЫ
+# ══════════════════════════════════════════════════════════
+def softmax(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def pos_enc(T, D):
+    pe  = np.zeros((T, D))
+    pos = np.arange(T)[:, None]
+    div = np.exp(np.arange(0, D, 2) * (-np.log(10000) / D))
+    pe[:, 0::2] = np.sin(pos * div)
+    pe[:, 1::2] = np.cos(pos * div)
+    return pe
+
+PE = pos_enc(T, D)   # считаем один раз
+
+# ══════════════════════════════════════════════════════════
+#  4. FORWARD — возвращаем всё нужное для backward
+# ══════════════════════════════════════════════════════════
+def forward(token_ids):
+    X0 = E[token_ids]          # (T, D)  эмбеддинги
+    X  = X0 + PE               # + позиции
+
+    Q      = X @ Wq            # (T, D)
+    K      = X @ Wk
+    Vm     = X @ Wv
+
+    scores = Q @ K.T / np.sqrt(D)                          # (T, T)
+    mask   = np.triu(np.ones((T, T)), k=1) * -1e9
+    scores = scores + mask
+    A      = softmax(scores)                                # (T, T) веса внимания
+
+    ctx    = A @ Vm            # (T, D)  контекстные векторы
+    last   = ctx[-1]           # (D,)    только последний токен
+    logits = last @ Wo         # (V,)
+
+    cache  = (token_ids, X, Q, K, Vm, A, ctx, last)
+    return logits, cache
+
+# ══════════════════════════════════════════════════════════
+#  5. LOSS — cross-entropy
+# ══════════════════════════════════════════════════════════
+def loss_and_grads(token_ids, target_id):
+    global E, Wq, Wk, Wv, Wo
+
+    logits, cache = forward(token_ids)
+    token_ids_, X, Q, K, Vm, A, ctx, last = cache
+
+    # Softmax + cross-entropy loss
+    probs = softmax(logits)
+    loss  = -np.log(probs[target_id] + 1e-9)
+
+    # ── Backward ──────────────────────────────────────────
+    # dL/d(logits): для cross-entropy + softmax это просто probs - 1_target
+    dlogits        = probs.copy()
+    dlogits[target_id] -= 1.0                # (V,)
+
+    # Wo: last @ Wo = logits  →  dWo = last.T @ dlogits
+    dWo   = last[:, None] @ dlogits[None, :]  # (D, V)
+    dlast = Wo @ dlogits                       # (D,)
+
+    # ctx[-1] = last  →  grad течёт только через последнюю строку ctx
+    dctx       = np.zeros_like(ctx)           # (T, D)
+    dctx[-1]   = dlast
+
+    # ctx = A @ Vm  →  dA = dctx @ Vm.T,  dVm = A.T @ dctx
+    dA  = dctx @ Vm.T                         # (T, T)
+    dVm = A.T @ dctx                          # (T, D)
+
+    # dWv = X.T @ dVm
+    dWv = X.T @ dVm                           # (D, D)
+    dX_from_v = dVm @ Wv.T                    # (T, D)
+
+    # Softmax backward для A
+    # dscores[i,j] = A[i,j] * (dA[i,j] - sum_k(dA[i,k]*A[i,k]))
+    dscores = A * (dA - (dA * A).sum(axis=-1, keepdims=True))  # (T, T)
+    dscores = dscores / np.sqrt(D)
+
+    # scores = Q @ K.T  →  dQ = dscores @ K,  dK = dscores.T @ Q
+    dQ = dscores @ K                           # (T, D)
+    dK = dscores.T @ Q                         # (T, D)
+
+    dWq = X.T @ dQ                             # (D, D)
+    dWk = X.T @ dK                             # (D, D)
+
+    dX  = dQ @ Wq.T + dK @ Wk.T + dX_from_v  # (T, D)
+
+    # Градиент по эмбеддингам (только строки token_ids)
+    dE  = np.zeros_like(E)
+    for t, idx in enumerate(token_ids_):
+        dE[idx] += dX[t]
+
+    grads = dict(E=dE, Wq=dWq, Wk=dWk, Wv=dWv, Wo=dWo)
+    return loss, grads
+
+# ══════════════════════════════════════════════════════════
+#  6. ОБУЧЕНИЕ — SGD с gradient clipping
+# ══════════════════════════════════════════════════════════
+def train(n_epochs=300, lr=0.05):
+    global E, Wq, Wk, Wv, Wo
+
+    # Строим пары (контекст → следующий токен)
+    pairs = []
+    for i in range(len(data) - T):
+        ctx    = data[i : i + T]
+        target = data[i + T]
+        pairs.append((ctx, target))
+
+    history = []
+    for epoch in range(n_epochs):
+        total_loss = 0
+        # Перемешиваем каждую эпоху
+        indices = np.random.permutation(len(pairs))
+
+        for idx in indices:
+            ctx, target = pairs[idx]
+            loss, grads = loss_and_grads(ctx, target)
+            total_loss += loss
+
+            # Gradient clipping — стабилизация обучения
+            for name, param in [("E", E), ("Wq", Wq), ("Wk", Wk), ("Wv", Wv), ("Wo", Wo)]:
+                g = grads[name]
+                norm = np.linalg.norm(g)
+                if norm > 1.0:
+                    g = g / norm
+                param -= lr * g
+
+        avg_loss = total_loss / len(pairs)
+        history.append(avg_loss)
+
+        if epoch % 50 == 0 or epoch == n_epochs - 1:
+            print(f"  Epoch {epoch:3d}  loss={avg_loss:.4f}")
+
+    return history
+
+# ══════════════════════════════════════════════════════════
+#  7. ГЕНЕРАЦИЯ
+# ══════════════════════════════════════════════════════════
+def generate(prompt, n_new=6, temperature=0.7, seed=1):
+    rng_g = np.random.default_rng(seed)
+    ids   = [w2i[w] for w in prompt.split() if w in w2i]
+
+    for _ in range(n_new):
+        ctx = ids[-T:]
+        if len(ctx) < T:
+            ctx = [0] * (T - len(ctx)) + ctx
+        logits, _ = forward(ctx)
+        probs     = softmax(logits / temperature)
+        nxt       = rng_g.choice(V, p=probs)
+        ids.append(nxt)
+
+    return " ".join(i2w[i] for i in ids)
+
+# ══════════════════════════════════════════════════════════
+#  8. ЗАПУСК
+# ══════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print("=== До обучения ===")
+    for s in range(3):
+        print(f"  {generate('кот сидел', seed=s)}")
+
+    print("\n=== Обучение ===")
+    history = train(n_epochs=300, lr=0.05)
+
+    print("\n=== После обучения ===")
+    for s in range(3):
+        print(f"  {generate('кот сидел', seed=s)}")
+
+    print("\n=== Проверка предсказаний ===")
+    test_cases = [
+        ["кот", "сидел", "на", "коврике"],
+        ["кот", "смотрел", "в", "окно"],
+        ["кот", "прыгнул", "на", "стол"],
+    ]
+    for ctx in test_cases:
+        logits, _ = forward([w2i[w] for w in ctx])
+        probs = softmax(logits)
+        top3  = np.argsort(probs)[::-1][:3]
+        pred  = " | ".join(f"{i2w[i]} {probs[i]:.2f}" for i in top3)
+        print(f"  {' '.join(ctx)} → {pred}")
