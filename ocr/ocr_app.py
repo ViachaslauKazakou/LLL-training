@@ -58,12 +58,11 @@ except ImportError:
 BASE_DIR = Path(__file__).parent
 DATA_PREP_DIR = BASE_DIR / "data_preparation"
 SCANS_DIR = DATA_PREP_DIR / "scans"
-OCR_RESULTS_DIR = DATA_PREP_DIR / "ocr_results"
-JSON_OUTPUT_DIR = DATA_PREP_DIR / "json_output"
-TRAINING_DATA_DIR = BASE_DIR / "data"
+TASKS_DIR = DATA_PREP_DIR / "tasks"  # Переименовано из json_output
+TRAINING_DATA_DIR = BASE_DIR.parent / "pytorch_llm" / "data"  # Путь к LLM данным
 
 # Создаём директории
-for dir_path in [SCANS_DIR, OCR_RESULTS_DIR, JSON_OUTPUT_DIR]:
+for dir_path in [SCANS_DIR, TASKS_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 # Категории задач
@@ -379,7 +378,7 @@ def parse_tasks_from_text(text: str) -> List[Dict]:
 
 def save_tasks_to_json(tasks: List[Dict], filename: str) -> Path:
     """Сохраняет задачи в JSON файл."""
-    output_path = JSON_OUTPUT_DIR / filename
+    output_path = TASKS_DIR / filename
     
     # Убираем поле number (оно временное)
     cleaned_tasks = []
@@ -499,7 +498,7 @@ with st.sidebar:
     # Статистика
     st.subheader("📊 Статистика")
     scans_count = len(list(SCANS_DIR.glob("*.jp*g"))) + len(list(SCANS_DIR.glob("*.png")))
-    json_count = len(list(JSON_OUTPUT_DIR.glob("*.json")))
+    json_count = len(list(TASKS_DIR.glob("*.json")))
     
     st.metric("Сканов загружено", scans_count)
     st.metric("JSON файлов создано", json_count)
@@ -509,7 +508,7 @@ with st.sidebar:
     st.subheader("📁 Папки")
     st.markdown(f"• [Сканы]({SCANS_DIR})")
     st.markdown(f"• [OCR результаты]({OCR_RESULTS_DIR})")
-    st.markdown(f"• [JSON выход]({JSON_OUTPUT_DIR})")
+    st.markdown(f"• [JSON выход]({TASKS_DIR})")
     st.markdown(f"• [Данные для обучения]({TRAINING_DATA_DIR})")
 
 # ═══════════════════════════════════════════════════════════════
@@ -1015,7 +1014,7 @@ with tab4:
             st.subheader("Копировать для обучения")
             st.info("Скопирует JSON в папку data/ для использования в обучении модели")
             
-            json_files = list(JSON_OUTPUT_DIR.glob("*.json"))
+            json_files = list(TASKS_DIR.glob("*.json"))
             if json_files:
                 selected_json = st.selectbox(
                     "Выберите JSON файл",
@@ -1025,7 +1024,7 @@ with tab4:
                 
                 if st.button("📋 Копировать в data/", width='stretch'):
                     try:
-                        source = JSON_OUTPUT_DIR / selected_json
+                        source = TASKS_DIR / selected_json
                         dest = copy_to_training_data(source)
                         st.success(f"✅ Скопировано в: {dest}")
                         st.code(str(dest))
@@ -1061,7 +1060,7 @@ with tab5:
     """)
     
     # Список всех JSON файлов
-    json_files = sorted(JSON_OUTPUT_DIR.glob("*.json"))
+    json_files = sorted(TASKS_DIR.glob("*.json"))
     
     if len(json_files) < 2:
         st.warning("⚠️ Нужно минимум 2 JSON файла для объединения. Сначала создайте несколько датасетов во вкладке 4.")
@@ -1115,7 +1114,7 @@ with tab5:
             total_tasks = 0
             for fname in selected_files:
                 try:
-                    with open(JSON_OUTPUT_DIR / fname, 'r', encoding='utf-8') as f:
+                    with open(TASKS_DIR / fname, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                         total_tasks += data.get('total_tasks', len(data.get('tasks', [])))
                 except:
@@ -1134,7 +1133,7 @@ with tab5:
                         sources = []
                         
                         for fname in selected_files:
-                            filepath = JSON_OUTPUT_DIR / fname
+                            filepath = TASKS_DIR / fname
                             with open(filepath, 'r', encoding='utf-8') as f:
                                 data = json.load(f)
                                 tasks = data.get('tasks', [])
@@ -1151,7 +1150,7 @@ with tab5:
                         }
                         
                         # Сохраняем
-                        output_path = JSON_OUTPUT_DIR / f"{dataset_name}.json"
+                        output_path = TASKS_DIR / f"{dataset_name}.json"
                         with open(output_path, 'w', encoding='utf-8') as f:
                             json.dump(combined_data, f, ensure_ascii=False, indent=2)
                         
@@ -1210,7 +1209,7 @@ with tab5:
                         "tasks": all_tasks
                     }
                     
-                    output_path = JSON_OUTPUT_DIR / f"{combined_name}.json"
+                    output_path = TASKS_DIR / f"{combined_name}.json"
                     with open(output_path, 'w', encoding='utf-8') as f:
                         json.dump(combined_data, f, ensure_ascii=False, indent=2)
                     

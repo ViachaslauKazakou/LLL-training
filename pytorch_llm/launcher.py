@@ -6,6 +6,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from logger import app_logger
 
 # Цвета для терминала
 GREEN = '\033[0;32m'
@@ -15,35 +16,35 @@ CYAN = '\033[0;36m'
 RESET = '\033[0m'
 
 def print_header():
-    print(f"{BLUE}{'━' * 60}{RESET}")
-    print(f"{GREEN}🚀 PyTorch LLM - Быстрый запуск{RESET}")
-    print(f"{BLUE}{'━' * 60}{RESET}\n")
+    app_logger.info(f"{BLUE}{'━' * 60}{RESET}")
+    app_logger.info(f"{GREEN}🚀 PyTorch LLM - Быстрый запуск{RESET}")
+    app_logger.info(f"{BLUE}{'━' * 60}{RESET}\n")
 
 def print_menu():
-    print("Выберите приложение:\n")
-    print(f"  {CYAN}1){RESET} 🤖 Тренировка трансформера (Streamlit UI)")
-    print(f"  {CYAN}2){RESET} 🔍 OCR распознавание (подготовка данных)")
-    print(f"  {CYAN}3){RESET} 🚀 API сервер (OpenAI-совместимый)")
-    print(f"  {CYAN}4){RESET} ⚙️  CLI тренировка")
-    print(f"  {CYAN}5){RESET} 💬 CLI inference (тестирование)")
-    print(f"  {CYAN}6){RESET} 📊 Сравнить чекпоинты")
-    print(f"  {CYAN}0){RESET} ❌ Выход\n")
+    app_logger.info("Выберите приложение:\n")
+    app_logger.info(f"  {CYAN}1){RESET} 🤖 Тренировка трансформера (Streamlit UI)")
+    app_logger.info(f"  {CYAN}2){RESET} 🔍 OCR распознавание (подготовка данных)")
+    app_logger.info(f"  {CYAN}3){RESET} 🚀 API сервер (OpenAI-совместимый)")
+    app_logger.info(f"  {CYAN}4){RESET} ⚙️  CLI тренировка")
+    app_logger.info(f"  {CYAN}5){RESET} 💬 CLI inference (тестирование)")
+    app_logger.info(f"  {CYAN}6){RESET} 📊 Сравнить чекпоинты")
+    app_logger.info(f"  {CYAN}0){RESET} ❌ Выход\n")
 
 def run_command(cmd: list, description: str):
-    print(f"{GREEN}▶ {description}...{RESET}\n")
+    app_logger.info(f"{GREEN}▶ {description}...{RESET}\n")
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"{YELLOW}⚠️  Ошибка при выполнении команды{RESET}")
+        app_logger.info(f"{YELLOW}⚠️  Ошибка при выполнении команды{RESET}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print(f"\n{YELLOW}⚠️  Прервано пользователем{RESET}")
+        app_logger.info(f"\n{YELLOW}⚠️  Прервано пользователем{RESET}")
         sys.exit(0)
 
 def main():
     # Проверяем что мы в правильной директории
     if not Path("app.py").exists():
-        print(f"{YELLOW}⚠️  Запустите скрипт из директории pytorch_llm/{RESET}")
+        app_logger.info(f"{YELLOW}⚠️  Запустите скрипт из директории pytorch_llm/{RESET}")
         sys.exit(1)
     
     print_header()
@@ -52,7 +53,7 @@ def main():
     try:
         choice = input("Введите номер [0-6]: ").strip()
     except KeyboardInterrupt:
-        print(f"\n{YELLOW}⚠️  Прервано{RESET}")
+        app_logger.info(f"\n{YELLOW}⚠️  Прервано{RESET}")
         sys.exit(0)
     
     if choice == "1":
@@ -86,10 +87,10 @@ def main():
             "Запускаю сравнение чекпоинтов"
         )
     elif choice == "0":
-        print(f"{GREEN}👋 До свидания!{RESET}")
+        app_logger.info(f"{GREEN}👋 До свидания!{RESET}")
         sys.exit(0)
     else:
-        print(f"{YELLOW}⚠️  Неверный выбор. Используйте числа от 0 до 6.{RESET}")
+        app_logger.info(f"{YELLOW}⚠️  Неверный выбор. Используйте числа от 0 до 6.{RESET}")
         sys.exit(1)
 
 if __name__ == "__main__":

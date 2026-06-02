@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from attention import MultiHeadAttention, create_causal_mask
 from config import ModelConfig
+from logger import data_logger
 
 
 class FeedForward(nn.Module):
@@ -43,10 +44,11 @@ class TransformerBlock(nn.Module):
     Один блок трансформера.
     
     Структура:
-        x → LayerNorm → MultiHeadAttention → Residual → 
-        → LayerNorm → FeedForward → Residual → выход
+        x → LayerNorm → MultiHeadAttention → Dropout → Residual → 
+        → LayerNorm → FeedForward → Dropout → Residual → выход
     
     Residual connections помогают градиентам течь через глубокую сеть.
+    Dropout после каждого sub-layer предотвращает overfitting.
     """
     
     def __init__(self, config: ModelConfig):
@@ -59,21 +61,23 @@ class TransformerBlock(nn.Module):
             config.n_heads, 
             config.dropout
         )
+        self.dropout1 = nn.Dropout(config.dropout)  # После attention
         
         # LayerNorm до feed-forward
         self.ln2 = nn.LayerNorm(config.d_model)
         self.ff = FeedForward(config.d_model, config.d_ff, config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)  # После feed-forward
         
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         x: (batch, seq_len, d_model)
         mask: (batch, 1, seq_len, seq_len)
         """
-        # Attention с residual connection
-        x = x + self.attn(self.ln1(x), mask)
+        # Attention → Dropout → Residual
+        x = x + self.dropout1(self.attn(self.ln1(x), mask))
         
-        # Feed-forward с residual connection  
-        x = x + self.ff(self.ln2(x))
+        # Feed-forward → Dropout → Residual  
+        x = x + self.dropout2(self.ff(self.ln2(x)))
         
         return x
 
@@ -121,7 +125,7 @@ class GPTModel(nn.Module):
         # Инициализация весов
         self.apply(self._init_weights)
         
-        print(f"Модель создана: {self.count_parameters():,} параметров")
+        data_logger.info(f"Модель создана: {self.count_parameters():,} параметров")
     
     def _init_weights(self, module: nn.Module):
         """Инициализация весов по GPT-2."""

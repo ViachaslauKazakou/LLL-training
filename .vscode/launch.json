@@ -57,6 +57,28 @@
             },
             "python": "${workspaceFolder}/.venv/bin/python",
             "envFile": "${workspaceFolder}/.env",
+        },
+
+        {
+            "name": "Streamlit: PyTorch LLM",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "streamlit",
+            "args": [
+                "run",
+                "app.py",
+                "--server.port",
+                "8502",
+                "--server.headless",
+                "true"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/pytorch_llm",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "justMyCode": false,
+            "python": "${workspaceFolder}/.venv/bin/python"
         }
     ]
 }

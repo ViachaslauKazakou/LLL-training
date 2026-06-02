@@ -96,7 +96,7 @@ def main():
     from config import get_device
     if args.device == "auto":
         args.device = get_device()
-        print(f"Auto-detected device: {args.device}")
+        training_logger.info(f"Auto-detected device: {args.device}")
     
     # Создаём sample датасет если нужно
     if args.prepare_sample:
@@ -127,12 +127,12 @@ def main():
     )
     
     # Загружаем данные
-    print("Загрузка данных...")
+    training_logger.info("Загрузка данных...")
     
     # Определяем формат данных
     from data import detect_file_format
     file_format = detect_file_format(args.data)
-    print(f"Формат: {file_format}")
+    training_logger.info(f"Формат: {file_format}")
     
     train_loader, val_loader, tokenizer = load_data(
         args.data,
@@ -142,7 +142,7 @@ def main():
     )
     
     # Обновляем vocab_size из токенизатора
-    model_config.vocab_size = len(tokenizer.vocab)
+    model_config.vocab_size = tokenizer.vocab_size() if hasattr(tokenizer, 'vocab_size') else len(tokenizer.vocab)
     
     # Продолжение обучения или с нуля?
     if args.continue_from:
@@ -158,7 +158,7 @@ def main():
         )
     else:
         # Создаём модель
-        print("\nСоздание модели...")
+        training_logger.info("\nСоздание модели...")
         model = GPTModel(model_config)
         
         # Создаём trainer и запускаем обучение
@@ -174,7 +174,7 @@ def main():
         
         trainer.train()
     
-    print("\n✅ Готово! Checkpoint сохранён в checkpoints/")
+    training_logger.info("\n✅ Готово! Checkpoint сохранён в checkpoints/")
 
 
 if __name__ == "__main__":

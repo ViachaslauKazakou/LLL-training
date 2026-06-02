@@ -49,6 +49,9 @@ def setup_logger(
     # Удаляем существующие handlers (если есть)
     logger.handlers = []
     
+    # Не передаём сообщения в root logger (предотвращает дублирование)
+    logger.propagate = False
+    
     # Formatter
     formatter = logging.Formatter(
         format_string,
@@ -62,9 +65,9 @@ def setup_logger(
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     
-    # Console handler (только для WARNING и выше, чтобы не дублировать print)
+    # Console handler — INFO и выше (всё видно в терминале)
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.WARNING)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     

@@ -1,4 +1,5 @@
 """
+from logger import app_logger
 Примеры использования Custom LLM API из разных языков.
 """
 
@@ -26,7 +27,7 @@ def chat_example():
         max_tokens=150
     )
     
-    print(response.choices[0].message.content)
+    app_logger.info(response.choices[0].message.content)
 
 # Text completion
 def completion_example():
@@ -37,7 +38,7 @@ def completion_example():
         max_tokens=100
     )
     
-    print(response.choices[0].text)
+    app_logger.info(response.choices[0].text)
 
 # Streaming (если реализовано)
 def streaming_example():
@@ -49,7 +50,7 @@ def streaming_example():
     
     for chunk in stream:
         if chunk.choices[0].delta.content:
-            print(chunk.choices[0].delta.content, end="")
+            app_logger.info(chunk.choices[0].delta.content, end="")
 
 # ═══════════════════════════════════════════════════════════════
 # Python (с requests)
@@ -72,7 +73,7 @@ def chat_with_requests():
     response = requests.post(url, json=payload)
     result = response.json()
     
-    print(result["choices"][0]["message"]["content"])
+    app_logger.info(result["choices"][0]["message"]["content"])
 
 # ═══════════════════════════════════════════════════════════════
 # Python (LangChain интеграция)
@@ -97,7 +98,7 @@ def langchain_example():
     
     # Выполняем
     result = chain.run(question="Что такое attention mechanism?")
-    print(result)
+    app_logger.info(result)
 
 # ═══════════════════════════════════════════════════════════════
 # JavaScript / Node.js
@@ -396,7 +397,7 @@ def specialized_qa_bot():
     
     # Использование
     answer = ask("Что такое backpropagation?")
-    print(answer)
+    app_logger.info(answer)
 
 def chat_with_history():
     """Чат с сохранением контекста."""
@@ -425,11 +426,11 @@ def chat_with_history():
         assistant_response = response.choices[0].message.content
         history.append({"role": "assistant", "content": assistant_response})
         
-        print(f"Ассистент: {assistant_response}")
+        app_logger.info(f"Ассистент: {assistant_response}")
 
 if __name__ == "__main__":
-    print("Примеры использования Custom LLM API")
-    print("=" * 50)
+    app_logger.info("Примеры использования Custom LLM API")
+    app_logger.info("=" * 50)
     
     # Запустите нужный пример:
     # chat_example()

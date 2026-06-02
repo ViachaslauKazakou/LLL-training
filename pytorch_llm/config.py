@@ -229,6 +229,12 @@ class TrainingConfig:
     save_every: int = 500        # сохранять каждые N шагов
     log_every: int = 50          # логировать каждые N шагов
     patience: int = 10           # early stopping: остановка после N проверок без улучшения
+    min_epochs: int = 0          # минимальное количество эпох (early stopping не сработает до этого)
+    min_delta: float = 0.01      # минимальное улучшение val_loss для early stopping
+    
+    # Optimizer settings
+    gradient_accumulation_steps: int = 1   # количество шагов для накопления градиентов
+    warmup_steps: int = 100      # количество шагов для warmup learning rate
     
     # Paths
     data_path: str = "data/corpus.txt"

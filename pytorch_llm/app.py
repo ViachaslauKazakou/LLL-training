@@ -9,15 +9,19 @@ import streamlit as st
 import torch
 from pathlib import Path
 import json
+import inspect
 import threading
 import time
+import math
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List
 
 from inference import load_model_for_inference, generate_text
-from data import CharTokenizer, prepare_sample_data
+from data import CharTokenizer, auto_select_stride, prepare_sample_data
 from config import get_small_config, get_medium_config, get_base_config, TrainingConfig, get_device, benchmark_device, get_memory_stats
+from utils.pdf_to_text import convert_pdf_to_text
+from utils.merge_datasets import analyze_dataset, merge_text_files
 from model import GPTModel
 from training import Trainer
 from data import load_data
@@ -51,6 +55,141 @@ st.set_page_config(
 )
 
 
+def call_load_data_compat(**kwargs):
+    """Вызывает load_data только с поддерживаемыми аргументами текущего рантайма."""
+    supported_params = inspect.signature(load_data).parameters
+    filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported_params}
+    dropped_params = sorted(set(kwargs) - set(filtered_kwargs))
+
+    if dropped_params:
+        app_logger.warning(
+            "load_data в текущем процессе не поддерживает аргументы: %s. "
+            "Вероятно, Streamlit держит старый импорт; перезапустите приложение.",
+            ", ".join(dropped_params),
+        )
+
+    return load_data(**filtered_kwargs)
+
+
+def estimate_dataset_tokens(stats: dict, tokenizer_type: str) -> int:
+    """Грубая оценка числа токенов для UI-подсказок."""
+    if tokenizer_type == "char":
+        return max(1, stats.get('total_chars', 0))
+
+    if tokenizer_type == "hybrid":
+        total_chars = stats.get('total_chars', 0)
+        total_words = stats.get('total_words', 0)
+        return max(1, int(max(total_words * 1.0, total_chars / 1.6)))
+
+    # Для tiktoken на русских и технических текстах обычно 1 токен ~= 2-3 символа.
+    total_chars = stats.get('total_chars', 0)
+    total_words = stats.get('total_words', 0)
+    return max(1, int(max(total_words * 1.3, total_chars / 2.2)))
+
+
+def build_training_data_advice(
+    file_path: str,
+    tokenizer_type: str,
+    context_len: int,
+    batch_size: int,
+    train_split: float = 0.9
+) -> dict | None:
+    """Строит рекомендации по гиперпараметрам на основе размера датасета."""
+    path = Path(file_path)
+    if not path.exists() or not path.is_file():
+        return None
+
+    stats = analyze_dataset(path)
+    estimated_tokens = estimate_dataset_tokens(stats, tokenizer_type)
+    train_tokens = max(1, int(estimated_tokens * train_split))
+    val_tokens = max(1, estimated_tokens - train_tokens)
+
+    train_stride = auto_select_stride(train_tokens, context_len, target_windows=1024)
+    val_stride = auto_select_stride(val_tokens, context_len, target_windows=256)
+    train_windows = max(0, (train_tokens - context_len) // train_stride)
+    val_windows = max(0, (val_tokens - context_len) // val_stride)
+    train_batches = math.ceil(train_windows / batch_size) if train_windows > 0 else 0
+
+    recommended_context = context_len
+    recommended_batch = batch_size
+
+    if stats['size_kb'] < 100:
+        recommended_context = min(context_len, 64)
+        recommended_batch = min(batch_size, 8)
+    elif stats['size_kb'] < 512:
+        recommended_context = min(context_len, 128)
+        recommended_batch = min(batch_size, 16)
+
+    severity = "success"
+    message = "Параметры выглядят адекватно для выбранного корпуса."
+    if train_batches < 10:
+        severity = "error"
+        message = (
+            f"Слишком мало train batch'ей: примерно {train_batches}. "
+            "Обучение будет шумным и почти без полезной динамики."
+        )
+    elif train_batches < 30:
+        severity = "warning"
+        message = (
+            f"Train batch'ей мало: примерно {train_batches}. "
+            "Лучше уменьшить batch size или context length."
+        )
+    elif train_batches < 100:
+        severity = "info"
+        message = (
+            f"Train batch'ей умеренно: примерно {train_batches}. "
+            "Для стабильности можно слегка уменьшить batch size."
+        )
+
+    return {
+        'stats': stats,
+        'estimated_tokens': estimated_tokens,
+        'train_windows': train_windows,
+        'val_windows': val_windows,
+        'train_batches': train_batches,
+        'train_stride': train_stride,
+        'val_stride': val_stride,
+        'recommended_context': recommended_context,
+        'recommended_batch': recommended_batch,
+        'severity': severity,
+        'message': message,
+    }
+
+
+def get_training_file_options(data_dir: Path) -> tuple[list[str], dict[str, str], int]:
+    """Собирает опции файлов для формы обучения."""
+    available_files = []
+
+    if data_dir.exists():
+        for ext in ["*.txt", "*.json"]:
+            available_files.extend(data_dir.glob(ext))
+
+        available_files = sorted(available_files, key=lambda f: f.stat().st_mtime, reverse=True)
+
+    file_options: list[str] = []
+    file_paths: dict[str, str] = {}
+
+    for file_path in available_files:
+        size_kb = file_path.stat().st_size / 1024
+        size_mb = size_kb / 1024
+        size_str = f"{size_mb:.1f} MB" if size_mb >= 1 else f"{size_kb:.1f} KB"
+        display_name = f"{file_path.name} ({size_str})"
+        file_options.append(display_name)
+        file_paths[display_name] = str(file_path)
+
+    if file_options:
+        file_options.append("✏️ Ввести путь вручную...")
+
+    default_file = "sample.txt"
+    default_idx = 0
+    for idx, option in enumerate(file_options[:-1] if file_options else []):
+        if default_file in option:
+            default_idx = idx
+            break
+
+    return file_options, file_paths, default_idx
+
+
 def load_available_checkpoints():
     """Находит все доступные checkpoint файлы."""
     checkpoint_dir = Path(__file__).parent / "checkpoints"
@@ -62,7 +201,7 @@ def load_available_checkpoints():
 
 
 @st.cache_resource
-def load_model_cached(checkpoint_path: str, data_path: str):
+def load_model_cached(checkpoint_path: str):
     """Кэширует загруженную модель."""
     from config import get_device
     device = get_device()
@@ -70,17 +209,29 @@ def load_model_cached(checkpoint_path: str, data_path: str):
     try:
         model, checkpoint = load_model_for_inference(checkpoint_path, device)
         
-        # Создаём токенизатор из checkpoint (если vocab есть) или из данных
-        if 'vocab' in checkpoint:
-            # Vocab сохранён в checkpoint - создаём токенизатор из него
+        # Создаём токенизатор из checkpoint
+        if 'tokenizer_config' in checkpoint:
+            # Новый формат: tokenizer_config содержит тип и параметры
+            from tokenizer import TikTokenizer, CharTokenizer as NewCharTokenizer
+            tok_config = checkpoint['tokenizer_config']
+            if tok_config['type'] == 'tiktoken':
+                tokenizer = TikTokenizer.from_dict(tok_config)
+                st.info(f"✓ TikTokenizer загружен: {tokenizer.vocab_size()} токенов ({tok_config.get('encoding_name', 'cl100k_base')})")
+            else:
+                tokenizer = NewCharTokenizer.from_dict(tok_config)
+                st.info(f"✓ CharTokenizer загружен: {tokenizer.vocab_size()} символов")
+        elif 'vocab' in checkpoint:
+            # Старый формат: vocab напрямую (CharTokenizer legacy)
             tokenizer = CharTokenizer.__new__(CharTokenizer)
             tokenizer.vocab = checkpoint['vocab']
             tokenizer.char_to_idx = {ch: idx for idx, ch in enumerate(tokenizer.vocab)}
             tokenizer.idx_to_char = {idx: ch for ch, idx in tokenizer.char_to_idx.items()}
+            st.info(f"✓ CharTokenizer загружен (legacy): {len(tokenizer.vocab)} символов")
         else:
-            # Старый checkpoint без vocab - создаём из файла данных
-            text = Path(data_path).read_text(encoding='utf-8')
-            tokenizer = CharTokenizer(text)
+            # Fallback: создаём TikTokenizer по умолчанию
+            from tokenizer import TikTokenizer
+            tokenizer = TikTokenizer(encoding_name='cl100k_base')
+            st.warning(f"⚠️ Checkpoint без токенизатора, создан TikTokenizer: {tokenizer.vocab_size()} токенов")
         
         return model, tokenizer, checkpoint, device
     except Exception as e:
@@ -228,28 +379,19 @@ def tab_generation():
     st.divider()
     st.subheader("💬 Генерация текста")
     
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        selected_checkpoint = st.selectbox(
-            "Модель для генерации",
-            [m['Модель'] for m in model_data_sorted],
-            index=0,
-            key="gen_select"
-        )
-    
-    with col2:
-        data_path = st.text_input(
-            "Путь к данным (для токенизатора)",
-            value="data/sample.txt"
-        )
+    selected_checkpoint = st.selectbox(
+        "Модель для генерации",
+        [m['Модель'] for m in model_data_sorted],
+        index=0,
+        key="gen_select"
+    )
     
     checkpoint_path = str(checkpoint_dir / selected_checkpoint)
     
     # Загружаем модель
     if st.button("🔄 Загрузить модель", type="primary"):
         with st.spinner("Загрузка модели..."):
-            model, tokenizer, checkpoint, device = load_model_cached(checkpoint_path, data_path)
+            model, tokenizer, checkpoint, device = load_model_cached(checkpoint_path)
             
             if model is not None:
                 st.success(f"✅ Модель загружена на {device}")
@@ -266,7 +408,7 @@ def tab_generation():
     
     # Проверяем, загружена ли модель
     try:
-        model, tokenizer, checkpoint, device = load_model_cached(checkpoint_path, data_path)
+        model, tokenizer, checkpoint, device = load_model_cached(checkpoint_path)
         if model is None:
             return
     except:
@@ -280,7 +422,7 @@ def tab_generation():
     
     prompt = st.text_area(
         "Введите начальный текст (промпт)",
-        value="Искусственный интеллект",
+        value="Что такое молярная масса?",
         height=100
     )
     
@@ -291,8 +433,8 @@ def tab_generation():
         max_tokens = st.slider(
             "Максимум новых токенов",
             min_value=10,
-            max_value=500,
-            value=100,
+            max_value=1000,
+            value=200,
             step=10
         )
     
@@ -300,10 +442,10 @@ def tab_generation():
         temperature = st.slider(
             "Temperature (креативность)",
             min_value=0.1,
-            max_value=2.0,
+            max_value=1.0,
             value=0.8,
             step=0.1,
-            help="Ниже = детерминированнее, выше = креативнее"
+            help="🌡️ Температура сэмплирования:\n0.1-0.3 = детерминированно, факты\n0.5-0.7 = сбалансированно (рекомендуется)\n0.8-1.0 = креативно, разнообразно"
         )
     
     with col3:
@@ -326,7 +468,7 @@ def tab_generation():
         
         with st.spinner("Генерация..."):
             try:
-                generated = generate_text(
+                generated, stats = generate_text(
                     model,
                     tokenizer,
                     prompt,
@@ -336,13 +478,24 @@ def tab_generation():
                     device=device
                 )
                 
-                app_logger.info(f"UI Генерация завершена: {len(generated)} символов")
+                app_logger.info(f"UI Генерация завершена: {len(generated)} символов, {stats['tokens_per_second']:.2f} tok/s")
                 st.success("✅ Готово!")
+                
+                # Показываем статистику
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Время генерации", f"{stats['total_time']:.2f} сек")
+                with col2:
+                    st.metric("Скорость", f"{stats['tokens_per_second']:.1f} tok/s")
+                with col3:
+                    st.metric("Сгенерировано токенов", stats['tokens_generated'])
+                with col4:
+                    st.metric("Токенов в промпте", stats['prompt_tokens'])
                 
                 # Сохраняем в историю
                 if 'generation_history' not in st.session_state:
                     st.session_state.generation_history = []
-                st.session_state.generation_history.append((prompt, generated))
+                st.session_state.generation_history.append((prompt, generated, stats))
                 
                 # Показываем результат
                 st.text_area(
@@ -364,11 +517,30 @@ def tab_generation():
     
     if st.session_state.generation_history:
         st.divider()
-        st.subheader("📜 История генераций")
         
-        for i, (p, g) in enumerate(reversed(st.session_state.generation_history[-5:])):
-            with st.expander(f"#{len(st.session_state.generation_history) - i}: {p[:50]}..."):
+        # Кнопка очистки истории и кэша
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.subheader("📜 История генераций")
+        with col2:
+            if st.button("🗑️ Очистить", help="Очистить историю и кэш"):
+                st.session_state.generation_history = []
+                st.cache_data.clear()
+                st.rerun()
+        
+        for i, item in enumerate(reversed(st.session_state.generation_history[-5:])):
+            # Поддержка старого формата (2 элемента) и нового (3 элемента)
+            if len(item) == 2:
+                p, g = item
+                stats = None
+            else:
+                p, g, stats = item
+            
+            idx = len(st.session_state.generation_history) - i
+            with st.expander(f"#{idx}: {p[:50]}..."):
                 st.text(g)
+                if stats:
+                    st.caption(f"⚡ {stats['tokens_per_second']:.1f} tok/s • {stats['total_time']:.2f}s • {stats['tokens_generated']} tokens")
 
 
 def tab_training():
@@ -442,6 +614,51 @@ def tab_training():
             # При дообучении размер определяется checkpoint
             config_size = None
             st.info("💡 Архитектура модели будет загружена из checkpoint")
+
+        data_dir = Path(__file__).parent / "data"
+        file_options, file_paths, default_file_idx = get_training_file_options(data_dir)
+
+        default_selected_option = file_options[default_file_idx] if file_options else None
+        selected_option_for_defaults = st.session_state.get("training_data_select", default_selected_option)
+        manual_input_option = "✏️ Ввести путь вручную..."
+
+        if selected_option_for_defaults == manual_input_option:
+            selected_data_path_for_defaults = st.session_state.get("training_manual_data_path", "data/")
+        elif selected_option_for_defaults in file_paths:
+            selected_data_path_for_defaults = file_paths[selected_option_for_defaults]
+        else:
+            selected_data_path_for_defaults = "data/sample.txt"
+
+        tokenizer_type_for_defaults = "char" if is_finetuning else st.session_state.get("training_tokenizer_type", "tiktoken")
+        default_advice = build_training_data_advice(
+            selected_data_path_for_defaults,
+            tokenizer_type_for_defaults,
+            128,
+            32,
+        )
+
+        previous_auto_context = st.session_state.get("training_auto_context_len")
+        previous_auto_batch = st.session_state.get("training_auto_batch_size")
+        previous_auto_source = st.session_state.get("training_auto_source_path")
+        current_context = st.session_state.get("train_context_len")
+        current_batch = st.session_state.get("train_batch_size")
+
+        can_auto_apply_defaults = (
+            current_context is None
+            or current_batch is None
+            or (
+                previous_auto_source != selected_data_path_for_defaults
+                and current_context == previous_auto_context
+                and current_batch == previous_auto_batch
+            )
+        )
+
+        if default_advice is not None and can_auto_apply_defaults:
+            st.session_state.train_context_len = int(default_advice['recommended_context'])
+            st.session_state.train_batch_size = int(default_advice['recommended_batch'])
+            st.session_state.training_auto_context_len = int(default_advice['recommended_context'])
+            st.session_state.training_auto_batch_size = int(default_advice['recommended_batch'])
+            st.session_state.training_auto_source_path = selected_data_path_for_defaults
         
         # Параметры обучения
         st.divider()
@@ -459,7 +676,8 @@ def tab_training():
             min_value=1, 
             max_value=128, 
             value=32,
-            disabled=training_state.active
+            disabled=training_state.active,
+            key="train_batch_size"
         )
         
         context_len = st.number_input(
@@ -469,7 +687,8 @@ def tab_training():
             value=128,
             step=16,
             help="Длина контекста (окно токенов). Уменьшите для маленьких датасетов!",
-            disabled=training_state.active
+            disabled=training_state.active,
+            key="train_context_len"
         )
         
         lr = st.number_input(
@@ -491,67 +710,154 @@ def tab_training():
             disabled=training_state.active
         )
         
+        min_epochs = st.number_input(
+            "Минимальное количество эпох",
+            min_value=0,
+            max_value=epochs if epochs else 10,
+            value=0,
+            help="Гарантированное минимальное количество эпох. Early stopping не сработает до завершения этих эпох. Установите 3 для гарантии минимум 3 эпох.",
+            disabled=training_state.active
+        )
+        
+        dropout = st.slider(
+            "Dropout rate",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.1,
+            step=0.05,
+            help="🛡️ Regularization: случайно выключает нейроны во время обучения. Помогает бороться с overfitting (когда train loss хороший, но val loss растет). Рекомендуется 0.1-0.2 для трансформеров.",
+            disabled=training_state.active or is_finetuning
+        )
+        
+        if is_finetuning:
+            st.caption("⚠️ Dropout определяется загруженным checkpoint")
+        
+        # Расширенные параметры обучения
+        with st.expander("⚙️ Расширенные параметры", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                weight_decay = st.number_input(
+                    "Weight Decay",
+                    min_value=0.0,
+                    max_value=0.3,
+                    value=0.01,
+                    step=0.01,
+                    format="%.3f",
+                    help="L2 regularization для весов модели. Помогает предотвратить overfitting. Рекомендуется 0.01-0.1.",
+                    disabled=training_state.active
+                )
+                
+                grad_clip = st.number_input(
+                    "Gradient Clipping",
+                    min_value=0.1,
+                    max_value=5.0,
+                    value=1.0,
+                    step=0.1,
+                    format="%.1f",
+                    help="Максимальная норма градиентов. Предотвращает exploding gradients. Рекомендуется 1.0.",
+                    disabled=training_state.active
+                )
+                
+                warmup_steps = st.number_input(
+                    "Warmup Steps",
+                    min_value=0,
+                    max_value=2000,
+                    value=100,
+                    step=50,
+                    help="Количество шагов для плавного увеличения learning rate от 0 до целевого значения. Стабилизирует начало обучения. Рекомендуется 100-500.",
+                    disabled=training_state.active
+                )
+            
+            with col2:
+                gradient_accumulation_steps = st.number_input(
+                    "Gradient Accumulation Steps",
+                    min_value=1,
+                    max_value=16,
+                    value=1,
+                    step=1,
+                    help="Накопление градиентов перед обновлением весов. Эффективно увеличивает batch size без доп. памяти. Полезно если batch_size ограничен памятью GPU.",
+                    disabled=training_state.active
+                )
+                
+                min_delta = st.number_input(
+                    "Early Stopping Min Delta",
+                    min_value=0.0,
+                    max_value=0.1,
+                    value=0.01,
+                    step=0.005,
+                    format="%.3f",
+                    help="Минимальное улучшение val_loss для сброса счетчика early stopping. Рекомендуется 0.01.",
+                    disabled=training_state.active
+                )
+                
+                checkpoint_interval = st.number_input(
+                    "Checkpoint Interval (steps)",
+                    min_value=100,
+                    max_value=2000,
+                    value=500,
+                    step=100,
+                    help="Сохранять checkpoint каждые N шагов. Рекомендуется 500.",
+                    disabled=training_state.active
+                )
+        
+        # Токенизатор
+        tokenizer_type = st.selectbox(
+            "Тип токенизатора",
+            options=["char", "hybrid", "tiktoken"],
+            index=1 if not is_finetuning else 0,  # hybrid по умолчанию для новых моделей
+            format_func=lambda x: {
+                "char": "Character-level (legacy, 1 символ = 1 токен)",
+                "hybrid": "Hybrid chemistry (доменные токены + fallback char)",
+                "tiktoken": "TikToken BPE (быстро, эффективно, GPT-4 tokenizer)"
+            }[x],
+            help="Для химии: hybrid обычно стабильнее char и легче tiktoken на малых корпусах.",
+            disabled=training_state.active or is_finetuning,
+            key="training_tokenizer_type"
+        )
+        
+        if tokenizer_type == "tiktoken":
+            tokenizer_encoding = st.selectbox(
+                "TikToken encoding",
+                options=["cl100k_base", "o200k_base", "p50k_base"],
+                index=0,
+                format_func=lambda x: {
+                    "cl100k_base": "cl100k_base (GPT-4, ~100K tokens, русский+химия)",
+                    "o200k_base": "o200k_base (GPT-4o, ~200K tokens)",
+                    "p50k_base": "p50k_base (Codex, ~50K tokens, для кода)"
+                }[x],
+                help="cl100k_base оптимален для русского языка и научных текстов",
+                disabled=training_state.active or is_finetuning
+            )
+        else:
+            tokenizer_encoding = None
+        
+        if is_finetuning:
+            st.caption("⚠️ Токенизатор определяется загруженным checkpoint")
+        
         # Данные
         st.markdown("**Данные для обучения**" if not is_finetuning else "**Новые данные для дообучения**")
-        
-        # Сканируем директорию data/ для файлов
-        data_dir = Path(__file__).parent / "data"
-        available_files = []
-        
-        if data_dir.exists():
-            # Ищем .txt и .json файлы
-            for ext in ["*.txt", "*.json"]:
-                available_files.extend(data_dir.glob(ext))
-            
-            # Сортируем по дате изменения (новые сверху)
-            available_files = sorted(available_files, key=lambda f: f.stat().st_mtime, reverse=True)
-        
+
         # Создаём список опций для selectbox
-        if available_files:
-            file_options = []
-            file_paths = {}
-            
-            for f in available_files:
-                size_kb = f.stat().st_size / 1024
-                size_mb = size_kb / 1024
-                
-                if size_mb >= 1:
-                    size_str = f"{size_mb:.1f} MB"
-                else:
-                    size_str = f"{size_kb:.1f} KB"
-                
-                # Формат: "filename.txt (123.4 KB)"
-                display_name = f"{f.name} ({size_str})"
-                file_options.append(display_name)
-                file_paths[display_name] = str(f)
-            
-            # Добавляем опцию для ручного ввода
-            file_options.append("✏️ Ввести путь вручную...")
-            
-            # Определяем индекс по умолчанию
-            default_file = "sample.txt"
-            default_idx = 0
-            for idx, opt in enumerate(file_options[:-1]):  # Исключаем "Ввести вручную"
-                if default_file in opt:
-                    default_idx = idx
-                    break
-            
+        if file_options:
             # Selectbox для выбора файла
             selected_option = st.selectbox(
                 "Выберите файл данных",
                 options=file_options,
-                index=default_idx,
+                index=default_file_idx,
                 disabled=training_state.active,
-                help="Файлы из директории data/ или введите путь вручную"
+                help="Файлы из директории data/ или введите путь вручную",
+                key="training_data_select"
             )
             
             # Определяем путь
-            if selected_option == "✏️ Ввести путь вручную...":
+            if selected_option == manual_input_option:
                 data_path = st.text_input(
                     "Путь к файлу",
                     value="data/",
                     disabled=training_state.active,
-                    help="Введите полный путь к файлу данных"
+                    help="Введите полный путь к файлу данных",
+                    key="training_manual_data_path"
                 )
             else:
                 data_path = file_paths[selected_option]
@@ -579,6 +885,59 @@ def tab_training():
                 st.success(f"✅ Файл готов к использованию ({file_size_mb:.1f} MB)")
             else:
                 st.success(f"✅ Файл готов к использованию ({file_size:.1f} KB)")
+
+            advice = build_training_data_advice(
+                data_path,
+                tokenizer_type if not is_finetuning else "char",
+                context_len,
+                batch_size,
+            )
+
+            if advice is not None:
+                st.caption("📊 Быстрая оценка датасета")
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                with metric_col1:
+                    st.metric("Оценка токенов", f"{advice['estimated_tokens']:,}")
+                with metric_col2:
+                    st.metric("Train окон", f"{advice['train_windows']:,}")
+                with metric_col3:
+                    st.metric("Train batch'ей", f"{advice['train_batches']:,}")
+
+                advice_message = (
+                    f"{advice['message']} Stride≈{advice['train_stride']} "
+                    f"(val≈{advice['val_stride']}), val окон≈{advice['val_windows']}."
+                )
+                if advice['severity'] == 'error':
+                    st.error(advice_message)
+                elif advice['severity'] == 'warning':
+                    st.warning(advice_message)
+                elif advice['severity'] == 'info':
+                    st.info(advice_message)
+                else:
+                    st.success(advice_message)
+
+                if (
+                    advice['recommended_context'] != context_len
+                    or advice['recommended_batch'] != batch_size
+                ):
+                    st.caption(
+                        "Рекомендация для этого корпуса: "
+                        f"context_len≈{advice['recommended_context']}, "
+                        f"batch_size≈{advice['recommended_batch']}."
+                    )
+
+                    if st.button(
+                        "✨ Применить рекомендации",
+                        key="apply_training_recommendations",
+                        disabled=training_state.active,
+                        help="Подставить рекомендованные context_len и batch_size в форму"
+                    ):
+                        st.session_state.train_context_len = int(advice['recommended_context'])
+                        st.session_state.train_batch_size = int(advice['recommended_batch'])
+                        st.session_state.training_auto_context_len = int(advice['recommended_context'])
+                        st.session_state.training_auto_batch_size = int(advice['recommended_batch'])
+                        st.session_state.training_auto_source_path = data_path
+                        st.rerun()
         
         # Название модели/эксперимента
         st.divider()
@@ -715,9 +1074,13 @@ def tab_training():
                             data_path=data_path,
                             device=device if device != "auto" else get_device(),
                             eval_every=200,
-                            save_every=500,
+                            save_every=checkpoint_interval,
                             log_every=50,
-                            patience=patience
+                            patience=patience,
+                            min_epochs=min_epochs,
+                            min_delta=min_delta,
+                            gradient_accumulation_steps=gradient_accumulation_steps,
+                            warmup_steps=warmup_steps
                         )
                         
                         # Проверка device и предупреждения
@@ -733,13 +1096,13 @@ def tab_training():
                         
                         # Быстрый бенчмарк device
                         training_state.logs.append("⚡ Бенчмарк производительности...")
-                        bench = benchmark_device(actual_device, size=512)
+                        bench = benchmark_device(actual_device, size=1024)
                         if bench['success']:
                             training_state.logs.append(f"   └─ Скорость: {bench['gflops']:.1f} GFLOPS ({bench['time_ms']:.2f} ms)")
                             
                             # Сравнение с CPU для наглядности (если не CPU)
                             if actual_device != "cpu":
-                                cpu_bench = benchmark_device("cpu", size=512)
+                                cpu_bench = benchmark_device("cpu", size=1024)
                                 if cpu_bench['success']:
                                     speedup = cpu_bench['time_ms'] / bench['time_ms']
                                     training_state.logs.append(f"   └─ Ускорение vs CPU: {speedup:.1f}x быстрее")
@@ -750,16 +1113,41 @@ def tab_training():
                         mem_stats = get_memory_stats(actual_device)
                         if mem_stats and not mem_stats.get('error'):
                             training_state.logs.append(f"💾 Доступно памяти: {mem_stats['total_gb']:.1f} GB")
+
+                        # Для fine-tuning используем тот же тип токенизатора, что в checkpoint.
+                        tokenizer_config = checkpoint.get('tokenizer_config', {})
+                        ft_tokenizer_type = 'char'
+                        ft_tokenizer_encoding = 'cl100k_base'
+
+                        if isinstance(tokenizer_config, dict):
+                            tokenizer_kind = tokenizer_config.get('type')
+                            if tokenizer_kind == 'tiktoken':
+                                ft_tokenizer_type = 'tiktoken'
+                                ft_tokenizer_encoding = tokenizer_config.get('encoding_name', 'cl100k_base')
+                            elif tokenizer_kind == 'hybrid':
+                                ft_tokenizer_type = 'hybrid'
+                            elif tokenizer_kind == 'char':
+                                ft_tokenizer_type = 'char'
+
+                        training_state.logs.append(
+                            f"🔤 Токенизатор fine-tuning: {ft_tokenizer_type}"
+                            + (f" ({ft_tokenizer_encoding})" if ft_tokenizer_type == 'tiktoken' else "")
+                        )
                         
                         # Загрузка данных
                         training_state.logs.append("📁 Загрузка новых данных...")
-                        train_loader, val_loader, tokenizer = load_data(
-                            data_path,
-                            model_config.context_len,
-                            batch_size
+                        train_loader, val_loader, tokenizer = call_load_data_compat(
+                            data_path=data_path,
+                            context_len=model_config.context_len,
+                            batch_size=batch_size,
+                            tokenizer_type=ft_tokenizer_type,
+                            tokenizer_encoding=ft_tokenizer_encoding,
+                            tokenizer_config=tokenizer_config if isinstance(tokenizer_config, dict) else None,
+                            normalize_chemistry=True,
                         )
                         
-                        training_state.logs.append(f"✅ Данные загружены ({len(tokenizer.vocab)} токенов)")
+                        vocab_size = tokenizer.vocab_size() if hasattr(tokenizer, 'vocab_size') else len(tokenizer.vocab)
+                        training_state.logs.append(f"✅ Данные загружены ({vocab_size} токенов)")
                         
                         # Создаём модель и загружаем веса
                         training_state.logs.append("🏗️ Восстановление модели...")
@@ -809,15 +1197,22 @@ def tab_training():
                         model_config.batch_size = batch_size
                         model_config.learning_rate = lr
                         model_config.context_len = context_len
+                        model_config.dropout = dropout  # Применяем dropout из UI
+                        model_config.weight_decay = weight_decay
+                        model_config.grad_clip = grad_clip
                         
                         train_config = TrainingConfig(
                             n_epochs=epochs,
                             data_path=data_path,
                             device=device if device != "auto" else get_device(),
                             eval_every=200,
-                            save_every=500,
+                            save_every=checkpoint_interval,
                             log_every=50,
-                            patience=patience
+                            patience=patience,
+                            min_epochs=min_epochs,
+                            min_delta=min_delta,
+                            gradient_accumulation_steps=gradient_accumulation_steps,
+                            warmup_steps=warmup_steps
                         )
                         
                         # Проверка device и предупреждения
@@ -833,13 +1228,13 @@ def tab_training():
                         
                         # Быстрый бенчмарк device
                         training_state.logs.append("⚡ Бенчмарк производительности...")
-                        bench = benchmark_device(actual_device, size=512)
+                        bench = benchmark_device(actual_device, size=1024)
                         if bench['success']:
                             training_state.logs.append(f"   └─ Скорость: {bench['gflops']:.1f} GFLOPS ({bench['time_ms']:.2f} ms)")
                             
                             # Сравнение с CPU для наглядности (если не CPU)
                             if actual_device != "cpu":
-                                cpu_bench = benchmark_device("cpu", size=512)
+                                cpu_bench = benchmark_device("cpu", size=1024)
                                 if cpu_bench['success']:
                                     speedup = cpu_bench['time_ms'] / bench['time_ms']
                                     training_state.logs.append(f"   └─ Ускорение vs CPU: {speedup:.1f}x быстрее")
@@ -853,13 +1248,16 @@ def tab_training():
                         
                         # Загрузка данных
                         training_state.logs.append("📁 Загрузка данных...")
-                        train_loader, val_loader, tokenizer = load_data(
-                            data_path,
-                            model_config.context_len,
-                            model_config.batch_size
+                        train_loader, val_loader, tokenizer = call_load_data_compat(
+                            data_path=data_path,
+                            context_len=model_config.context_len,
+                            batch_size=model_config.batch_size,
+                            tokenizer_type=tokenizer_type,
+                            tokenizer_encoding=tokenizer_encoding if tokenizer_type == 'tiktoken' else 'cl100k_base',
+                            normalize_chemistry=True,
                         )
                         
-                        model_config.vocab_size = len(tokenizer.vocab)
+                        model_config.vocab_size = tokenizer.vocab_size() if hasattr(tokenizer, 'vocab_size') else len(tokenizer.vocab)
                         
                         # Создание модели
                         training_state.logs.append(f"🏗️ Создание модели ({model_config.vocab_size} токенов)...")
@@ -884,6 +1282,8 @@ def tab_training():
                     # ОБЩИЙ ЦИКЛ ОБУЧЕНИЯ (для обоих режимов)
                     # ═══════════════════════════════════════════════════════
                     
+                    last_completed_epoch = 0
+                    
                     for epoch in range(train_config.n_epochs):
                         if not training_state.active or training_state.stop_requested:
                             training_state.logs.append("⏹️ Обучение остановлено пользователем")
@@ -899,6 +1299,11 @@ def tab_training():
                         
                         val_loss = trainer.evaluate()
                         
+                        # Обновляем best_val_loss и метрики
+                        if val_loss < trainer.best_val_loss:
+                            trainer.best_val_loss = val_loss
+                            trainer.steps_without_improvement = 0
+                        
                         # Обновляем метрики
                         training_state.metrics['epoch'] = epoch + 1
                         training_state.metrics['step'] = trainer.global_step
@@ -908,14 +1313,24 @@ def tab_training():
                         training_state.metrics['progress'] = (epoch + 1) / train_config.n_epochs
                         
                         log_msg = f"Эпоха {epoch+1}/{train_config.n_epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
-                        if val_loss < trainer.best_val_loss:
+                        if val_loss == trainer.best_val_loss:
                             log_msg += " ⭐ Новый рекорд!"
                         training_state.logs.append(log_msg)
+                        
+                        last_completed_epoch = epoch + 1
                     
-                    if training_state.active:
+                    # В конце обучения обновляем лучший checkpoint
+                    if last_completed_epoch > 0:
+                        # Обновляем лучший checkpoint с финальными весами
+                        best_checkpoint = f"{model_name}_best.pt"
+                        trainer.save_checkpoint(best_checkpoint)
+                        
                         training_state.logs.append("✅ Обучение завершено!")
-                        training_state.logs.append(f"💾 Checkpoint сохранён в {train_config.checkpoint_dir}/")
-                        app_logger.info("UI Обучение завершено успешно")
+                        training_state.logs.append(f"📊 Завершено эпох: {last_completed_epoch}/{train_config.n_epochs}")
+                        training_state.logs.append(f"⭐ Лучший checkpoint: {best_checkpoint}")
+                        training_state.logs.append(f"📊 Best val_loss: {trainer.best_val_loss:.4f}")
+                        training_state.logs.append(f"💾 Промежуточные checkpoint'ы сохранялись каждые {checkpoint_interval} шагов")
+                        app_logger.info(f"UI Обучение завершено успешно ({last_completed_epoch} эпох)")
                     
                 except Exception as e:
                     training_state.logs.append(f"❌ Ошибка: {str(e)}")
@@ -1178,8 +1593,209 @@ def tab_data():
     
     st.divider()
     
+    # Конвертация PDF
+    st.subheader("5. Конвертер PDF → TXT")
+    
+    st.markdown("""
+    Загрузите PDF книгу/учебник, конвертируем в чистый текст для обучения.
+    """)
+    
+    uploaded_pdf = st.file_uploader(
+        "Загрузите PDF файл",
+        type=["pdf"],
+        help="PDF книга будет конвертирована в текст",
+        key="pdf_uploader"
+    )
+    
+    if uploaded_pdf is not None:
+        pdf_name = uploaded_pdf.name
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"📄 Файл: {pdf_name}")
+        with col2:
+            size_mb = len(uploaded_pdf.getvalue()) / (1024 * 1024)
+            st.info(f"📦 Размер: {size_mb:.2f} MB")
+        
+        clean_text = st.checkbox(
+            "Очистить текст",
+            value=True,
+            help="Убрать лишние пробелы, восстановить параграфы",
+            key="pdf_clean"
+        )
+        
+        output_name = st.text_input(
+            "Имя выходного файла",
+            value=pdf_name.replace('.pdf', '_converted.txt'),
+            key="pdf_output_name"
+        )
+        
+        if st.button("🔄 Конвертировать PDF", type="primary", key="convert_pdf_btn"):
+            try:
+                # Создаём директории
+                input_pdf_dir = data_dir / "input_pdf"
+                input_pdf_dir.mkdir(exist_ok=True)
+                
+                # Сохраняем PDF
+                pdf_path = input_pdf_dir / pdf_name
+                pdf_path.write_bytes(uploaded_pdf.getvalue())
+                st.info(f"💾 Сохранен PDF: {pdf_path}")
+                
+                # Конвертируем
+                output_path = data_dir / output_name
+                with st.spinner("⏳ Конвертация PDF в текст..."):
+                    result = convert_pdf_to_text(
+                        str(pdf_path),
+                        str(output_path),
+                        clean=clean_text
+                    )
+                
+                st.success(f"✅ Конвертировано: {output_path}")
+                
+                # Статистика
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Страниц", result['pages'])
+                with col2:
+                    st.metric("Символов", f"{result['chars']:,}")
+                with col3:
+                    st.metric("Слов", f"{result['words']:,}")
+                with col4:
+                    st.metric("Размер", f"{result['size_kb']:.1f} KB")
+                
+                # Превью
+                text_content = output_path.read_text(encoding='utf-8')
+                with st.expander("Превью (первые 500 символов)"):
+                    st.text(text_content[:500] + "..." if len(text_content) > 500 else text_content)
+                    
+            except Exception as e:
+                st.error(f"❌ Ошибка конвертации: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+    
+    st.divider()
+    
+    # Объединение датасетов
+    st.subheader("6. Объединить датасеты")
+    
+    st.markdown("""
+    Объедините несколько текстовых файлов в один датасет для обучения.
+    """)
+    
+    data_dir = Path(__file__).parent / "data"
+    if data_dir.exists():
+        txt_files = sorted([f.name for f in data_dir.glob("*.txt")])
+        
+        if len(txt_files) >= 2:
+            selected_files = st.multiselect(
+                "Выберите файлы для объединения (минимум 2)",
+                options=txt_files,
+                help="Выберите 2 или больше файлов",
+                key="merge_files_select"
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                add_headers = st.checkbox(
+                    "Добавить заголовки",
+                    value=True,
+                    help="Добавить имя файла перед каждым датасетом",
+                    key="merge_add_headers"
+                )
+            with col2:
+                separator = st.text_input(
+                    "Разделитель",
+                    value="\n\n---\n\n",
+                    help="Разделитель между датасетами",
+                    key="merge_separator"
+                )
+            
+            output_merged_name = st.text_input(
+                "Имя объединенного файла",
+                value="combined_dataset.txt",
+                key="merge_output_name"
+            )
+            
+            # Показываем превью выбранных файлов
+            if selected_files:
+                with st.expander(f"📊 Анализ выбранных файлов ({len(selected_files)})"):
+                    total_size = 0
+                    total_lines = 0
+                    
+                    for fname in selected_files:
+                        fpath = data_dir / fname
+                        size_kb = fpath.stat().st_size / 1024
+                        lines = len(fpath.read_text(encoding='utf-8').splitlines())
+                        total_size += size_kb
+                        total_lines += lines
+                        st.text(f"📄 {fname}: {size_kb:.1f} KB, {lines:,} строк")
+                    
+                    st.divider()
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Итого размер", f"{total_size:.1f} KB")
+                    with col2:
+                        st.metric("Итого строк", f"{total_lines:,}")
+            
+            if st.button("🔗 Объединить датасеты", type="primary", disabled=len(selected_files) < 2, key="merge_btn"):
+                try:
+                    file_paths = [str(data_dir / fname) for fname in selected_files]
+                    output_path = str(data_dir / output_merged_name)
+                    
+                    with st.spinner("⏳ Объединение файлов..."):
+                        result = merge_text_files(
+                            file_paths,
+                            output_path,
+                            separator=separator,
+                            add_headers=add_headers,
+                            analyze=True
+                        )
+                    
+                    st.success(f"✅ Объединено в: {output_path}")
+                    
+                    # Показываем анализ объединенного файла
+                    st.markdown("**📊 Анализ объединенного датасета:**")
+                    
+                    stats = result['analysis']
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Размер", f"{stats['size_mb']:.2f} MB")
+                    with col2:
+                        st.metric("Символов", f"{stats['total_chars']:,}")
+                    with col3:
+                        st.metric("Слов", f"{stats['total_words']:,}")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Строк", f"{stats['total_lines']:,}")
+                    with col2:
+                        cyrillic_pct = stats['cyrillic_percent']
+                        st.metric("Кириллица", f"{cyrillic_pct:.1f}%")
+                    with col3:
+                        latin_pct = stats['latin_percent']
+                        st.metric("Латиница", f"{latin_pct:.1f}%")
+                    
+                    # Предупреждение о языке
+                    if stats['size_mb'] > 1:
+                        if cyrillic_pct > 80:
+                            st.success("✅ Хороший русскоязычный датасет!")
+                        elif latin_pct > 80:
+                            st.info("ℹ️ Датасет на английском языке")
+                        else:
+                            st.warning("⚠️ Смешанный язык — модель может путаться")
+                    
+                except Exception as e:
+                    st.error(f"❌ Ошибка объединения: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+        else:
+            st.info("Нужно минимум 2 текстовых файла для объединения")
+    
+    st.divider()
+    
     # Список существующих файлов
-    st.subheader("5. Доступные датасеты")
+    st.subheader("7. Доступные датасеты")
     
     data_dir = Path(__file__).parent / "data"
     if data_dir.exists():
@@ -1297,16 +1913,232 @@ def tab_info():
             st.info("Обучение будет на CPU (медленнее в 10-50 раз)")
 
 
+def tab_logs():
+    """Вкладка просмотра логов в реальном времени."""
+    st.header("📊 Просмотр логов")
+    
+    # Путь к логам
+    logs_dir = Path(__file__).parent / "logs"
+    
+    # Инициализация session state для автообновления
+    if 'logs_auto_refresh' not in st.session_state:
+        st.session_state.logs_auto_refresh = False
+    if 'logs_last_refresh' not in st.session_state:
+        st.session_state.logs_last_refresh = time.time()
+    
+    # Проверка директории
+    if not logs_dir.exists():
+        st.error(f"📁 Директория логов не найдена: {logs_dir}")
+        return
+    
+    # Получение списка файлов логов
+    log_files = sorted([f.name for f in logs_dir.glob("*.log")])
+    
+    if not log_files:
+        st.warning("⚠️ Нет файлов логов в директории")
+        st.info(f"Путь: {logs_dir}")
+        return
+    
+    # Контролы
+    col1, col2, col3 = st.columns([2, 2, 1])
+    
+    with col1:
+        selected_log = st.selectbox(
+            "📄 Выберите файл лога",
+            options=log_files,
+            help="Файлы из /logs директории",
+            key="log_file_select"
+        )
+    
+    with col2:
+        log_level = st.selectbox(
+            "🔍 Фильтр по уровню",
+            options=["ALL", "INFO", "WARNING", "ERROR", "DEBUG"],
+            index=0,
+            help="Показывать только логи выбранного уровня",
+            key="log_level_filter"
+        )
+    
+    with col3:
+        # Кнопка Start/Stop автообновления
+        if st.session_state.logs_auto_refresh:
+            if st.button("⏸️ Стоп", type="secondary", key="stop_refresh"):
+                st.session_state.logs_auto_refresh = False
+                st.rerun()
+        else:
+            if st.button("▶️ Старт", type="primary", key="start_refresh"):
+                st.session_state.logs_auto_refresh = True
+                st.session_state.logs_last_refresh = time.time()
+                st.rerun()
+    
+    # Настройки отображения
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        num_lines = st.slider(
+            "📏 Количество строк",
+            min_value=50,
+            max_value=1000,
+            value=200,
+            step=50,
+            help="Показать последние N строк",
+            key="log_num_lines"
+        )
+    
+    with col2:
+        show_timestamps = st.checkbox(
+            "🕐 Показать время",
+            value=True,
+            help="Отображать временные метки",
+            key="log_show_timestamps"
+        )
+    
+    with col3:
+        highlight_keywords = st.checkbox(
+            "🎨 Подсветка",
+            value=True,
+            help="Цветная подсветка ключевых слов",
+            key="log_highlight"
+        )
+    
+    st.divider()
+    
+    # Статус автообновления
+    if st.session_state.logs_auto_refresh:
+        current_time = time.time()
+        elapsed = int(current_time - st.session_state.logs_last_refresh)
+        st.info(f"🔄 Автообновление активно (обновлено {elapsed} сек. назад)")
+    
+    # Чтение файла лога
+    log_path = logs_dir / selected_log
+    
+    try:
+        # Получаем размер файла
+        file_size = log_path.stat().st_size
+        
+        if file_size == 0:
+            st.warning("⚠️ Файл лога пустой")
+            st.info("Логи появятся после запуска обучения или генерации")
+            return
+        
+        # Читаем последние N строк
+        with open(log_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Применяем фильтр по уровню
+        if log_level != "ALL":
+            lines = [line for line in lines if f"[{log_level}]" in line]
+        
+        # Берем последние N строк
+        lines = lines[-num_lines:]
+        
+        # Разворачиваем порядок — свежие записи вверху
+        lines = lines[::-1]
+        
+        # Информация о файле
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📄 Файл", selected_log.replace('.log', ''))
+        with col2:
+            st.metric("📦 Размер", f"{file_size / 1024:.1f} KB")
+        with col3:
+            st.metric("📝 Всего строк", len(lines))
+        with col4:
+            if lines:
+                # Извлекаем последнее время из лога (теперь первая строка — самая свежая)
+                last_line = lines[0]
+                if last_line.strip():
+                    time_match = last_line.split()[0:2]
+                    if len(time_match) == 2:
+                        st.metric("🕐 Последняя запись", time_match[1])
+        
+        st.divider()
+        
+        # Отображение логов
+        if not lines:
+            st.info(f"ℹ️ Нет логов уровня {log_level}")
+        else:
+            # Создаем текст лога
+            log_text = ""
+            
+            for line in lines:
+                line = line.rstrip()
+                
+                if not show_timestamps:
+                    # Убираем временные метки (первые 19 символов: "YYYY-MM-DD HH:MM:SS")
+                    if len(line) > 19 and line[10] == ' ':
+                        line = line[20:]
+                
+                if highlight_keywords:
+                    # Применяем цветную подсветку через Markdown
+                    # Epoch
+                    if "Epoch" in line:
+                        line = line.replace("Epoch", "**Epoch**")
+                    
+                    # Loss значения
+                    import re
+                    line = re.sub(r'(loss=[\d\.]+)', r'**\1**', line)
+                    line = re.sub(r'(val_loss=[\d\.]+)', r'**\1**', line)
+                    line = re.sub(r'(train_loss=[\d\.]+)', r'**\1**', line)
+                    line = re.sub(r'(avg_loss=[\d\.]+)', r'**\1**', line)
+                    
+                    # Progress bars
+                    if '█' in line or '100%' in line:
+                        line = f"🔄 {line}"
+                    
+                    # Checkmarks
+                    if '✓' in line or 'завершен' in line:
+                        line = f"✅ {line}"
+                    
+                    # Errors
+                    if '[ERROR]' in line or 'Error' in line or 'error' in line:
+                        line = f"❌ {line}"
+                    
+                    # Warnings
+                    if '[WARNING]' in line or 'Warning' in line:
+                        line = f"⚠️ {line}"
+                    
+                    # Info
+                    if '[INFO]' in line:
+                        line = f"ℹ️ {line}"
+                
+                log_text += line + "\n"
+            
+            # Отображаем в text_area для возможности копирования
+            st.text_area(
+                "Логи:",
+                value=log_text,
+                height=500,
+                disabled=False,
+                label_visibility="collapsed"
+            )
+        
+        # Автообновление
+        if st.session_state.logs_auto_refresh:
+            current_time = time.time()
+            if current_time - st.session_state.logs_last_refresh >= 5:
+                st.session_state.logs_last_refresh = current_time
+                time.sleep(0.1)  # Небольшая задержка перед rerun
+                st.rerun()
+    
+    except Exception as e:
+        st.error(f"❌ Ошибка чтения файла: {e}")
+        import traceback
+        with st.expander("Детали ошибки"):
+            st.code(traceback.format_exc())
+
+
 def main():
     st.title("🤖 PyTorch LLM")
     st.caption("Полноценный трансформер с нуля")
     
     # Создаём вкладки
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🎯 Генерация",
         "🎓 Обучение",
         "📁 Данные",
-        "ℹ️ Инфо"
+        "ℹ️ Инфо",
+        "📊 Логи"
     ])
     
     with tab1:
@@ -1320,6 +2152,9 @@ def main():
     
     with tab4:
         tab_info()
+    
+    with tab5:
+        tab_logs()
 
 
 if __name__ == "__main__":

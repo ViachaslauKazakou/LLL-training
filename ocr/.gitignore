@@ -1,0 +1,23 @@
+# OCR временные файлы
+data_preparation/scans/*.jpg
+data_preparation/scans/*.jpeg
+data_preparation/scans/*.png
+data_preparation/tasks/*.json
+
+# Но сохраняем структуру папок
+!data_preparation/scans/.gitkeep
+!data_preparation/tasks/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db

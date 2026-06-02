@@ -14,6 +14,8 @@ API Server для модели с OpenAI-compatible интерфейсом.
       }'
 """
 
+from logger import app_logger
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -92,7 +94,7 @@ async def load_model():
     """Загружает модель при запуске сервера."""
     global MODEL, TOKENIZER, DEVICE
     
-    print(f"🔄 Загрузка модели из {CHECKPOINT_PATH}...")
+    app_logger.info(f"🔄 Загрузка модели из {CHECKPOINT_PATH}...")
     
     DEVICE = get_device()
     MODEL, checkpoint = load_model_for_inference(CHECKPOINT_PATH, DEVICE)
@@ -101,9 +103,9 @@ async def load_model():
     text = Path(DATA_PATH).read_text(encoding='utf-8')
     TOKENIZER = CharTokenizer(text)
     
-    print(f"✅ Модель загружена на {DEVICE}")
-    print(f"   Параметров: {MODEL.count_parameters():,}")
-    print(f"   Vocab size: {len(TOKENIZER.vocab)}")
+    app_logger.info(f"✅ Модель загружена на {DEVICE}")
+    app_logger.info(f"   Параметров: {MODEL.count_parameters():,}")
+    app_logger.info(f"   Vocab size: {len(TOKENIZER.vocab)}")
 
 # ═══════════════════════════════════════════════════════════════
 # Эндпоинты
