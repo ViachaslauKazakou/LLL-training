@@ -5,7 +5,10 @@ convert_json.py — Конвертер JSON → TXT для обучения мо
 Поддерживаемые форматы JSON:
 1. Interview ({"items": [{"topic", "content"}]}) — вопросы для интервью
 2. Tasks ({"tasks": [{"question", "solution", "answer"}]}) — задачи из OCR
-3. Forum ({"User": ..., "messages": {...}}) — форумные сообщения
+3. Forum:
+    - {"User": ..., "messages": {"Тема": ["msg1", ...]}}
+    - {"title": "...", "messages": [{"author": "...", "content": "..."}, ...]}
+    — форумные сообщения
 
 Использование:
     python convert_json.py input.json                    # Вывод в консоль
@@ -40,7 +43,7 @@ def convert_json(input_path: str, output_path: str = None, auto_name: bool = Fal
     data_logger.info(f"🔍 Анализ файла: {input_file.name}")
     json_type = detect_json_type(str(input_file))
     data_logger.info(f"📋 Тип JSON: {json_type}")
-    data_logger.info()
+    data_logger.info("")
     
     # Конвертируем
     text = None
@@ -56,18 +59,19 @@ def convert_json(input_path: str, output_path: str = None, auto_name: bool = Fal
         data_logger.info(f"   Поддерживаемые форматы:")
         data_logger.info(f"   - interview: {{'items': [{{'topic', 'content'}}]}}")
         data_logger.info(f"   - tasks: {{'tasks': [{{'question', 'solution', 'answer'}}]}}")
-        data_logger.info(f"   - forum: {{'User': ..., 'messages': {{}}}}")
+        data_logger.info(f"   - forum(dict): {{'User': ..., 'messages': {{'topic': [...]}}}}")
+        data_logger.info(f"   - forum(list): {{'title': '...', 'messages': [{{'author','content'}}]}}")
         sys.exit(1)
     
     if not text or len(text) == 0:
         data_logger.info(f"❌ Ошибка конвертации: пустой результат")
         sys.exit(1)
     
-    data_logger.info()
+    data_logger.info("")
     data_logger.info(f"✅ Конвертация успешна!")
     data_logger.info(f"   Длина текста: {len(text):,} символов")
     data_logger.info(f"   Строк: {text.count(chr(10)):,}")
-    data_logger.info()
+    data_logger.info("")
     
     # Сохраняем или выводим
     if output_path:
@@ -83,7 +87,7 @@ def convert_json(input_path: str, output_path: str = None, auto_name: bool = Fal
         if len(text) > 2000:
             data_logger.info("...")
             data_logger.info(f"(Еще {len(text) - 2000:,} символов)")
-        data_logger.info()
+        data_logger.info("")
         data_logger.info("💡 Для сохранения в файл используйте:")
         data_logger.info(f"   python convert_json.py {input_path} output.txt")
         data_logger.info(f"   python convert_json.py {input_path} --auto")
@@ -93,7 +97,7 @@ def convert_json(input_path: str, output_path: str = None, auto_name: bool = Fal
     output_file.write_text(text, encoding='utf-8')
     data_logger.info(f"💾 Сохранено в: {output_file}")
     data_logger.info(f"   Размер файла: {output_file.stat().st_size / 1024:.1f} KB")
-    data_logger.info()
+    data_logger.info("")
     data_logger.info(f"🚀 Готово к обучению!")
     data_logger.info(f"   В Streamlit UI выберите: {output_file}")
 

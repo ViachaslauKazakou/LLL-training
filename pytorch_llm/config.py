@@ -207,7 +207,7 @@ class ModelConfig:
     
     # Training
     batch_size: int = 32
-    learning_rate: float = 3e-4
+    learning_rate: float = 1.5e-4
     weight_decay: float = 0.01
     grad_clip: float = 1.0       # gradient clipping
     
@@ -224,8 +224,8 @@ class ModelConfig:
 class TrainingConfig:
     """Параметры обучения."""
     
-    n_epochs: int = 10
-    eval_every: int = 200        # evaluate каждые N шагов (было 500, уменьшили для контроля)
+    n_epochs: int = 30
+    eval_every: int = 150        # evaluate каждые N шагов
     save_every: int = 500        # сохранять каждые N шагов
     log_every: int = 50          # логировать каждые N шагов
     patience: int = 10           # early stopping: остановка после N проверок без улучшения
@@ -234,7 +234,7 @@ class TrainingConfig:
     
     # Optimizer settings
     gradient_accumulation_steps: int = 1   # количество шагов для накопления градиентов
-    warmup_steps: int = 100      # количество шагов для warmup learning rate
+    warmup_steps: int = 400      # количество шагов для warmup learning rate
     
     # Paths
     data_path: str = "data/corpus.txt"
@@ -261,7 +261,7 @@ def get_small_config() -> ModelConfig:
 
 
 def get_medium_config() -> ModelConfig:
-    """Средняя модель (~50M параметров)."""
+    """Средняя модель (~50M параметров). Оптимальна для корпусов 1-10 MB."""
     return ModelConfig(
         vocab_size=10000,
         d_model=512,
@@ -269,6 +269,7 @@ def get_medium_config() -> ModelConfig:
         n_heads=8,
         d_ff=2048,
         context_len=512,
+        dropout=0.05,       # Меньше регуляризации для небольшого датасета
     )
 
 

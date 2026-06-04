@@ -11,6 +11,7 @@ import torch
 
 from config import get_small_config, TrainingConfig
 from data import load_data, prepare_sample_data
+from logger import training_logger
 from model import GPTModel
 from training import Trainer, continue_training
 
@@ -33,7 +34,7 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
+        default=30,
         help="Количество эпох"
     )
     parser.add_argument(
@@ -45,8 +46,45 @@ def main():
     parser.add_argument(
         "--lr",
         type=float,
-        default=3e-4,
+        default=1.5e-4,
         help="Learning rate"
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        choices=["hybrid", "bpe", "tiktoken", "char", "char_new"],
+        default="hybrid",
+        help="Тип токенизатора для обучения (по умолчанию: hybrid)"
+    )
+    parser.add_argument(
+        "--tokenizer-encoding",
+        type=str,
+        default="cl100k_base",
+        help="Имя tiktoken энкодера (используется только при --tokenizer tiktoken)"
+    )
+    parser.add_argument(
+        "--hybrid-min-freq",
+        type=int,
+        default=2,
+        help="Минимальная частота токена для HybridTokenizer"
+    )
+    parser.add_argument(
+        "--hybrid-max-domain-tokens",
+        type=int,
+        default=8000,
+        help="Максимум доменных токенов для HybridTokenizer"
+    )
+    parser.add_argument(
+        "--bpe-vocab-size",
+        type=int,
+        default=8000,
+        help="Целевой размер словаря для BPETokenizer (рекомендуемо 4000-16000)"
+    )
+    parser.add_argument(
+        "--bpe-min-frequency",
+        type=int,
+        default=2,
+        help="Минимальная частота merge для BPETokenizer"
     )
     parser.add_argument(
         "--device",
@@ -80,8 +118,32 @@ def main():
     parser.add_argument(
         "--patience",
         type=int,
-        default=5,
-        help="Early stopping: остановка после N проверок без улучшения (default: 5)"
+        default=15,
+        help="Early stopping: остановка после N проверок без улучшения (default: 15)"
+    )
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=20,
+        help="Минимальное число эпох до возможного early stopping (default: 20)"
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=200,
+        help="Число шагов warmup learning rate (default: 200)"
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Шаг между окнами датасета. None = auto. Для overlap используйте context_len//2"
+    )
+    parser.add_argument(
+        "--clean-forum",
+        action="store_true",
+        default=False,
+        help="Очистить форумный шум (username#:, имена авторов) перед обучением"
     )
     parser.add_argument(
         "--model-name",
@@ -123,7 +185,10 @@ def main():
         n_epochs=args.epochs,
         data_path=args.data,
         device=args.device,
-        patience=args.patience
+        patience=args.patience,
+        min_epochs=args.min_epochs,
+        eval_every=150,
+        warmup_steps=args.warmup_steps,
     )
     
     # Загружаем данные
@@ -138,7 +203,15 @@ def main():
         args.data,
         model_config.context_len,
         model_config.batch_size,
-        include_topics=args.include_topics  # Параметр для JSON
+        include_topics=args.include_topics,  # Параметр для JSON
+        tokenizer_type=args.tokenizer,
+        tokenizer_encoding=args.tokenizer_encoding,
+        hybrid_min_token_freq=args.hybrid_min_freq,
+        hybrid_max_domain_tokens=args.hybrid_max_domain_tokens,
+        bpe_vocab_size=args.bpe_vocab_size,
+        bpe_min_frequency=args.bpe_min_frequency,
+        stride=args.stride,
+        clean_forum=args.clean_forum,
     )
     
     # Обновляем vocab_size из токенизатора

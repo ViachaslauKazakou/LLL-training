@@ -8,6 +8,7 @@ inference.py — генерация текста обученной модель
 import argparse
 import torch
 from typing import Union
+import time
 
 from model import GPTModel
 from tokenizer import CharTokenizer, TikTokenizer
@@ -58,6 +59,7 @@ def generate_text(
     max_new_tokens: int = 100,
     temperature: float = 0.8,
     top_k: int = 50,
+    top_p: float = 0.9,
     device: str = "cuda"
 ) -> tuple[str, dict]:
     """
@@ -75,11 +77,10 @@ def generate_text(
             - tokens_per_second: скорость генерации (токенов/сек)
             - prompt_tokens: количество токенов в промпте
     """
-    import time
     
     inference_logger.info(f"Генерация текста")
     inference_logger.info(f"Промпт: '{prompt}' ({len(prompt)} символов)")
-    inference_logger.info(f"Параметры: max_tokens={max_new_tokens}, temp={temperature}, top_k={top_k}")
+    inference_logger.info(f"Параметры: max_tokens={max_new_tokens}, temp={temperature}, top_k={top_k}, top_p={top_p}")
     
     # Кодируем промпт
     input_ids = torch.tensor(
@@ -97,7 +98,8 @@ def generate_text(
         input_ids,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
-        top_k=top_k
+        top_k=top_k,
+        top_p=top_p,
     )
     
     end_time = time.time()
@@ -150,14 +152,16 @@ def interactive_generation(
             max_tokens = int(input("Максимум токенов [100]: ") or "100")
             temperature = float(input("Temperature [0.8]: ") or "0.8")
             top_k = int(input("Top-k [50]: ") or "50")
-            
+            top_p = float(input("Top-p [0.9]: ") or "0.9")
+
             inference_logger.info("\nГенерация...\n")
-            
+
             generated, stats = generate_text(
                 model, tokenizer, prompt,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
                 top_k=top_k,
+                top_p=top_p,
                 device=device
             )
             
@@ -220,6 +224,12 @@ def main():
         help="Top-k sampling"
     )
     parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.9,
+        help="Nucleus sampling (top-p). 0.9 = выбирать из токенов с суммарной вероятностью 90%%"
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -275,6 +285,7 @@ def main():
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             device=args.device
         )
         

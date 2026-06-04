@@ -13,6 +13,7 @@ import inspect
 import threading
 import time
 import math
+import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List
@@ -80,6 +81,11 @@ def estimate_dataset_tokens(stats: dict, tokenizer_type: str) -> int:
         total_chars = stats.get('total_chars', 0)
         total_words = stats.get('total_words', 0)
         return max(1, int(max(total_words * 1.0, total_chars / 1.6)))
+
+    if tokenizer_type == "bpe":
+        total_chars = stats.get('total_chars', 0)
+        total_words = stats.get('total_words', 0)
+        return max(1, int(max(total_words * 1.2, total_chars / 2.1)))
 
     # Для tiktoken на русских и технических текстах обычно 1 токен ~= 2-3 символа.
     total_chars = stats.get('total_chars', 0)
@@ -212,11 +218,17 @@ def load_model_cached(checkpoint_path: str):
         # Создаём токенизатор из checkpoint
         if 'tokenizer_config' in checkpoint:
             # Новый формат: tokenizer_config содержит тип и параметры
-            from tokenizer import TikTokenizer, CharTokenizer as NewCharTokenizer
+            from tokenizer import TikTokenizer, HybridChemTokenizer, BPETokenizer, CharTokenizer as NewCharTokenizer
             tok_config = checkpoint['tokenizer_config']
             if tok_config['type'] == 'tiktoken':
                 tokenizer = TikTokenizer.from_dict(tok_config)
                 st.info(f"✓ TikTokenizer загружен: {tokenizer.vocab_size()} токенов ({tok_config.get('encoding_name', 'cl100k_base')})")
+            elif tok_config['type'] == 'hybrid':
+                tokenizer = HybridChemTokenizer.from_dict(tok_config)
+                st.info(f"✓ HybridTokenizer загружен: {tokenizer.vocab_size()} токенов")
+            elif tok_config['type'] == 'bpe':
+                tokenizer = BPETokenizer.from_dict(tok_config)
+                st.info(f"✓ BPETokenizer загружен: {tokenizer.vocab_size()} токенов")
             else:
                 tokenizer = NewCharTokenizer.from_dict(tok_config)
                 st.info(f"✓ CharTokenizer загружен: {tokenizer.vocab_size()} символов")
@@ -250,135 +262,316 @@ def tab_generation():
     # Получаем список checkpoints
     checkpoints = load_available_checkpoints()
     
-    if not checkpoints:
+    _gen_source_from_state = st.session_state.get("gen_model_source", "🔥 PyTorch checkpoint")
+    if not checkpoints and "MLX" not in _gen_source_from_state:
         st.warning("⚠️ Нет доступных checkpoint файлов в checkpoints/")
-        st.info("Сначала обучите модель на вкладке '🎓 Обучение'")
-        return
-    
-    # ═══════════════════════════════════════════════════════
-    # ТАБЛИЦА МОДЕЛЕЙ
-    # ═══════════════════════════════════════════════════════
-    st.subheader("📋 Доступные модели")
-    
-    # Собираем данные о всех моделях
-    model_data = []
-    for ckpt_name in checkpoints:
-        ckpt_path = checkpoint_dir / ckpt_name
-        try:
-            import torch
-            checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-            
-            # Извлекаем dataset name из пути
-            dataset_path = checkpoint.get('dataset_path', 'N/A')
-            if dataset_path != 'N/A':
-                dataset_name = Path(dataset_path).stem
-            else:
-                dataset_name = 'N/A'
-            
-            # Дата обучения
-            training_date = checkpoint.get('training_date', 'N/A')
-            if training_date != 'N/A':
-                # Форматируем дату (убираем время)
-                training_date = training_date.split('T')[0]
-            
-            model_data.append({
-                'Модель': ckpt_name,
-                'Датасет': dataset_name[:30] + '...' if len(dataset_name) > 30 else dataset_name,
-                'Step': checkpoint.get('global_step', 0),
-                'Val Loss': checkpoint.get('best_val_loss', float('inf')),
-                'Vocab': checkpoint.get('config').vocab_size if 'config' in checkpoint else 'N/A',
-                'Дата': training_date,
-                'Размер': f"{ckpt_path.stat().st_size / 1024 / 1024:.1f} MB",
-                '_path': str(ckpt_path)
-            })
-        except Exception as e:
-            model_data.append({
-                'Модель': ckpt_name,
-                'Датасет': 'error',
-                'Step': 'error',
-                'Val Loss': float('inf'),
-                'Vocab': 'N/A',
-                'Дата': 'N/A',
-                'Размер': f"{ckpt_path.stat().st_size / 1024 / 1024:.1f} MB",
-                '_path': str(ckpt_path)
-            })
-    
-    # Сортируем по Val Loss
-    model_data_sorted = sorted(model_data, key=lambda x: x['Val Loss'])
-    
-    # Отображаем таблицу
-    import pandas as pd
-    df = pd.DataFrame([{k: v for k, v in m.items() if not k.startswith('_')} for m in model_data_sorted])
-    
-    # Форматируем Val Loss
-    df['Val Loss'] = df['Val Loss'].apply(lambda x: f"{x:.4f}" if x != float('inf') else "∞")
-    
-    # Добавляем индикатор лучшей модели
-    best_idx = 0
-    df.insert(0, '⭐', ['🏆' if i == best_idx else '' for i in range(len(df))])
-    
-    st.dataframe(
-        df,
-        width='stretch',
-        hide_index=True
-    )
-    
-    st.caption("🏆 = лучший val_loss")
-    
-    # ═══════════════════════════════════════════════════════
-    # УПРАВЛЕНИЕ МОДЕЛЯМИ
-    # ═══════════════════════════════════════════════════════
-    st.divider()
-    st.subheader("🔧 Управление моделями")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        selected_for_action = st.selectbox(
-            "Выберите модель",
-            [m['Модель'] for m in model_data_sorted],
-            key="action_select"
+        st.info(
+            "Сначала обучите модель на вкладке '🎓 Обучение', "
+            "или переключитесь на режим '🤖 MLX модель' ниже."
         )
-    
-    with col2:
-        # Кнопка "Сделать базовой"
-        if st.button("⭐ Сделать базовой", width='stretch'):
-            if selected_for_action != "best_model.pt":
-                try:
-                    import shutil
-                    src = checkpoint_dir / selected_for_action
-                    dst = checkpoint_dir / "best_model.pt"
-                    shutil.copy2(src, dst)
-                    st.success(f"✅ {selected_for_action} → best_model.pt")
-                    app_logger.info(f"UI Модель {selected_for_action} установлена как базовая")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Ошибка: {e}")
-            else:
-                st.info("Эта модель уже базовая!")
-    
-    with col3:
-        # Кнопка удаления
-        if st.button("🗑️ Удалить", width='stretch', type="secondary"):
-            if selected_for_action == "best_model.pt":
-                st.error("❌ Нельзя удалить best_model.pt!")
-            else:
-                try:
-                    (checkpoint_dir / selected_for_action).unlink()
-                    st.success(f"✅ {selected_for_action} удалён")
-                    app_logger.info(f"UI Модель {selected_for_action} удалена")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Ошибка: {e}")
+        # Still show model source selector so user can switch to MLX
+        st.radio(
+            "Источник модели",
+            ["🔥 PyTorch checkpoint", "🤖 MLX модель"],
+            horizontal=True,
+            key="gen_model_source",
+        )
+        return
+
+    if checkpoints:
+        # ═══════════════════════════════════════════════════════
+        # ТАБЛИЦА МОДЕЛЕЙ (только для PyTorch)
+        # ═══════════════════════════════════════════════════════
+        st.subheader("📋 Доступные модели")
+
+        # Собираем данные о всех моделях
+        model_data = []
+        for ckpt_name in checkpoints:
+            ckpt_path = checkpoint_dir / ckpt_name
+            try:
+                import torch
+                checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+                # Извлекаем dataset name из пути
+                dataset_path = checkpoint.get('dataset_path', 'N/A')
+                if dataset_path != 'N/A':
+                    dataset_name = Path(dataset_path).stem
+                else:
+                    dataset_name = 'N/A'
+
+                # Дата обучения
+                training_date = checkpoint.get('training_date', 'N/A')
+                if training_date != 'N/A':
+                    # Форматируем дату (убираем время)
+                    training_date = training_date.split('T')[0]
+
+                model_data.append({
+                    'Модель': ckpt_name,
+                    'Датасет': dataset_name[:30] + '...' if len(dataset_name) > 30 else dataset_name,
+                    'Step': checkpoint.get('global_step', 0),
+                    'Val Loss': checkpoint.get('best_val_loss', float('inf')),
+                    'Vocab': checkpoint.get('config').vocab_size if 'config' in checkpoint else 'N/A',
+                    'Дата': training_date,
+                    'Размер': f"{ckpt_path.stat().st_size / 1024 / 1024:.1f} MB",
+                    '_path': str(ckpt_path)
+                })
+            except Exception as e:
+                model_data.append({
+                    'Модель': ckpt_name,
+                    'Датасет': 'error',
+                    'Step': 'error',
+                    'Val Loss': float('inf'),
+                    'Vocab': 'N/A',
+                    'Дата': 'N/A',
+                    'Размер': f"{ckpt_path.stat().st_size / 1024 / 1024:.1f} MB",
+                    '_path': str(ckpt_path)
+                })
+
+        # Сортируем по Val Loss
+        model_data_sorted = sorted(model_data, key=lambda x: x['Val Loss'])
+
+        # Отображаем таблицу
+        import pandas as pd
+        df = pd.DataFrame([{k: v for k, v in m.items() if not k.startswith('_')} for m in model_data_sorted])
+
+        # Форматируем Val Loss
+        df['Val Loss'] = df['Val Loss'].apply(lambda x: f"{x:.4f}" if x != float('inf') else "∞")
+
+        # Добавляем индикатор лучшей модели
+        best_idx = 0
+        df.insert(0, '⭐', ['🏆' if i == best_idx else '' for i in range(len(df))])
+
+        st.dataframe(
+            df,
+            width='stretch',
+            hide_index=True
+        )
+
+        st.caption("🏆 = лучший val_loss")
+
+        # ═══════════════════════════════════════════════════════
+        # УПРАВЛЕНИЕ МОДЕЛЯМИ
+        # ═══════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("🔧 Управление моделями")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            selected_for_action = st.selectbox(
+                "Выберите модель",
+                [m['Модель'] for m in model_data_sorted],
+                key="action_select"
+            )
+
+        with col2:
+            # Кнопка "Сделать базовой"
+            if st.button("⭐ Сделать базовой", width='stretch'):
+                if selected_for_action != "best_model.pt":
+                    try:
+                        import shutil
+                        src = checkpoint_dir / selected_for_action
+                        dst = checkpoint_dir / "best_model.pt"
+                        shutil.copy2(src, dst)
+                        st.success(f"✅ {selected_for_action} → best_model.pt")
+                        app_logger.info(f"UI Модель {selected_for_action} установлена как базовая")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Ошибка: {e}")
+                else:
+                    st.info("Эта модель уже базовая!")
+
+        with col3:
+            # Кнопка удаления
+            if st.button("🗑️ Удалить", width='stretch', type="secondary"):
+                if selected_for_action == "best_model.pt":
+                    st.error("❌ Нельзя удалить best_model.pt!")
+                else:
+                    try:
+                        (checkpoint_dir / selected_for_action).unlink()
+                        st.success(f"✅ {selected_for_action} удалён")
+                        app_logger.info(f"UI Модель {selected_for_action} удалена")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Ошибка: {e}")
     
     # ═══════════════════════════════════════════════════════
     # ВЫБОР МОДЕЛИ ДЛЯ ГЕНЕРАЦИИ
     # ═══════════════════════════════════════════════════════
     st.divider()
     st.subheader("💬 Генерация текста")
-    
+
+    gen_model_source = st.radio(
+        "Источник модели",
+        ["🔥 PyTorch checkpoint", "🤖 MLX модель"],
+        horizontal=True,
+        key="gen_model_source",
+        help=(
+            "**PyTorch checkpoint** — использовать модель, обученную с нуля или дообученную в этом приложении.\n\n"
+            "**MLX модель** — использовать готовую предобученную модель (Llama, Qwen, ...) "
+            "с опциональным LoRA адаптером. Работает только на Apple Silicon."
+        ),
+    )
+    is_mlx_gen = "MLX" in gen_model_source
+
+    if is_mlx_gen:
+        # ═══════════════════════════════════════════════════════
+        # MLX GENERATION
+        # ═══════════════════════════════════════════════════════
+        from mlx_integration import (
+            MLX_AVAILABLE, CURATED_MODELS, get_model_display_label,
+            load_mlx_model, mlx_generate,
+        )
+
+        if not MLX_AVAILABLE:
+            st.error("❌ mlx-lm не установлен. Выполните: `poetry add mlx-lm`")
+        else:
+            mlx_gen_model_labels = [get_model_display_label(m) for m in CURATED_MODELS]
+            mlx_gen_selected_label = st.selectbox(
+                "Модель",
+                mlx_gen_model_labels,
+                index=0,
+                key="mlx_gen_model_select",
+            )
+            mlx_gen_model_idx = mlx_gen_model_labels.index(mlx_gen_selected_label)
+            mlx_gen_model_id = CURATED_MODELS[mlx_gen_model_idx].hf_id
+
+            use_custom_gen_id = st.checkbox("Свой HF ID", key="mlx_gen_custom_id")
+            if use_custom_gen_id:
+                mlx_gen_model_id = st.text_input(
+                    "HuggingFace model ID",
+                    value=mlx_gen_model_id,
+                    key="mlx_gen_model_id_input",
+                )
+
+            # Adapters list
+            adapters_dir = Path(__file__).parent / "adapters"
+            available_adapters = []
+            if adapters_dir.exists():
+                available_adapters = [
+                    d.name for d in adapters_dir.iterdir()
+                    if d.is_dir() and any(d.glob("*.safetensors"))
+                ]
+
+            mlx_gen_adapter_path = None
+            if available_adapters:
+                use_adapter = st.checkbox(
+                    "Использовать LoRA адаптер",
+                    value=False,
+                    key="mlx_gen_use_adapter",
+                    help="Адаптер из папки adapters/ — результат MLX fine-tuning",
+                )
+                if use_adapter:
+                    selected_adapter = st.selectbox(
+                        "Выберите адаптер",
+                        available_adapters,
+                        key="mlx_gen_adapter_select",
+                    )
+                    mlx_gen_adapter_path = str(adapters_dir / selected_adapter)
+            else:
+                st.caption("ℹ️ Нет обученных адаптеров (adapters/). Сначала запустите MLX Fine-tuning.")
+
+            # Generation params
+            mlx_gen_prompt = st.text_area(
+                "Промпт",
+                value="Расскажи о реакции нейтрализации.",
+                height=100,
+                key="mlx_gen_prompt",
+            )
+
+            mlx_gen_system_prompt = st.text_input(
+                "System prompt (опционально)",
+                value="",
+                key="mlx_gen_system",
+                placeholder="Ты — эксперт-химик.",
+            )
+
+            gcol1, gcol2, gcol3 = st.columns(3)
+            with gcol1:
+                mlx_gen_max_tokens = st.slider(
+                    "Max токенов", min_value=50, max_value=1000, value=200, step=50,
+                    key="mlx_gen_max_tokens",
+                )
+            with gcol2:
+                mlx_gen_temperature = st.slider(
+                    "Temperature", min_value=0.1, max_value=1.0, value=0.8, step=0.1,
+                    key="mlx_gen_temp",
+                )
+            with gcol3:
+                mlx_gen_top_p = st.slider(
+                    "Top-p", min_value=0.1, max_value=1.0, value=0.9, step=0.05,
+                    key="mlx_gen_top_p",
+                )
+
+            mlx_gen_rep_penalty = st.slider(
+                "Repetition penalty", min_value=1.0, max_value=2.0, value=1.1, step=0.05,
+                key="mlx_gen_rep_penalty",
+                help=(
+                    "Штраф за повторение уже сгенерированных токенов. "
+                    "1.0 = без штрафа, 1.1–1.3 = умеренный штраф (рекомендуется)."
+                ),
+            )
+
+            if st.button("✨ Сгенерировать (MLX)", type="primary", width="stretch", key="mlx_gen_btn"):
+                if not mlx_gen_prompt.strip():
+                    st.warning("Введите промпт!")
+                else:
+                    # Cache model in session_state
+                    cache_key = f"mlx_model_{mlx_gen_model_id}_{mlx_gen_adapter_path}"
+                    if st.session_state.get("mlx_gen_cache_key") != cache_key:
+                        with st.spinner(f"Загрузка модели {mlx_gen_model_id}..."):
+                            try:
+                                loaded_model, loaded_tokenizer = load_mlx_model(
+                                    mlx_gen_model_id, mlx_gen_adapter_path
+                                )
+                                st.session_state["mlx_gen_model"] = loaded_model
+                                st.session_state["mlx_gen_tokenizer"] = loaded_tokenizer
+                                st.session_state["mlx_gen_cache_key"] = cache_key
+                                st.success("✅ Модель загружена")
+                            except Exception as e:
+                                st.error(f"Ошибка загрузки: {e}")
+                                st.stop()
+
+                    with st.spinner("Генерация..."):
+                        try:
+                            generated, stats = mlx_generate(
+                                st.session_state["mlx_gen_model"],
+                                st.session_state["mlx_gen_tokenizer"],
+                                mlx_gen_prompt,
+                                max_tokens=mlx_gen_max_tokens,
+                                temperature=mlx_gen_temperature,
+                                top_p=mlx_gen_top_p,
+                                repetition_penalty=mlx_gen_rep_penalty,
+                                system_prompt=mlx_gen_system_prompt,
+                            )
+                            st.success("✅ Готово!")
+                            sc1, sc2, sc3, sc4 = st.columns(4)
+                            with sc1:
+                                st.metric("Время", f"{stats['total_time']:.2f}s")
+                            with sc2:
+                                st.metric("Скорость", f"{stats['tokens_per_second']:.1f} tok/s")
+                            with sc3:
+                                st.metric("Токенов", stats['tokens_generated'])
+                            with sc4:
+                                st.metric("Промпт", stats['prompt_tokens'])
+
+                            st.text_area("Результат", value=generated, height=300, disabled=True)
+                            st.code(generated, language=None)
+
+                            if "generation_history" not in st.session_state:
+                                st.session_state.generation_history = []
+                            st.session_state.generation_history.append(
+                                (mlx_gen_prompt, generated, stats)
+                            )
+                        except Exception as e:
+                            st.error(f"Ошибка генерации: {e}")
+        return  # skip PyTorch generation section
+
+    if not checkpoints:
+        return
+
     selected_checkpoint = st.selectbox(
         "Модель для генерации",
         [m['Модель'] for m in model_data_sorted],
@@ -435,7 +628,19 @@ def tab_generation():
             min_value=10,
             max_value=1000,
             value=200,
-            step=10
+            step=10,
+            help=(
+                "Максимальное количество токенов, которое модель сгенерирует в ответ на промпт. "
+                "Генерация останавливается раньше, если модель выберет токен конца текста.\n\n"
+                "Один токен ≈ 1 символ (char-токенизатор) или 3–6 символов (BPE/tiktoken).\n\n"
+                "Рекомендации:\n"
+                "• 50–100 — короткие ответы, завершение фразы\n"
+                "• 200 — стандартный абзац (default)\n"
+                "• 300–500 — развёрнутый ответ\n"
+                "• 500+ — длинный текст, эссе\n\n"
+                "⚠️ Модель не может выйти за пределы context_len, с которым обучалась. "
+                "Длинные запросы + длинная генерация = обрезание начала промпта."
+            )
         )
     
     with col2:
@@ -445,7 +650,20 @@ def tab_generation():
             max_value=1.0,
             value=0.8,
             step=0.1,
-            help="🌡️ Температура сэмплирования:\n0.1-0.3 = детерминированно, факты\n0.5-0.7 = сбалансированно (рекомендуется)\n0.8-1.0 = креативно, разнообразно"
+            help=(
+                "Управляет «случайностью» при выборе следующего токена.\n\n"
+                "Перед сэмплированием логиты делятся на temperature. "
+                "Это сжимает или растягивает распределение вероятностей:\n\n"
+                "**Низкая температура (0.1–0.4)** → распределение острее, "
+                "модель почти всегда выбирает наиболее вероятный токен. "
+                "Текст предсказуемый, повторяющийся, фактический.\n\n"
+                "**Средняя температура (0.5–0.7)** → баланс между связностью "
+                "и разнообразием. Рекомендуется для большинства задач.\n\n"
+                "**Высокая температура (0.8–1.0)** → распределение сглаживается, "
+                "модель чаще выбирает неожиданные токены. "
+                "Текст креативный, но может терять смысл.\n\n"
+                "💡 Используйте вместе с Top-k и Top-p для тонкой настройки генерации."
+            )
         )
     
     with col3:
@@ -455,17 +673,58 @@ def tab_generation():
             max_value=100,
             value=50,
             step=5,
-            help="Выбирать из топ-k наиболее вероятных токенов"
+            help=(
+                "Ограничивает выбор следующего токена топ-K наиболее вероятными вариантами. "
+                "Все остальные токены получают вероятность 0.\n\n"
+                "**Маленький k (5–20)** → текст связный, предсказуемый, мало разнообразия.\n"
+                "**Большой k (50–100)** → больше вариантов, текст разнообразнее, "
+                "но могут проскакивать неуместные слова.\n\n"
+                "Рекомендации:\n"
+                "• 10–20 — для фактических, структурированных текстов\n"
+                "• 40–50 — хороший баланс (default)\n"
+                "• 80–100 — максимальное разнообразие\n\n"
+                "💡 Top-k и Top-p работают вместе: сначала применяется Top-k, "
+                "затем из оставшихся токенов Top-p дополнительно обрезает «хвост»."
+            )
         )
-    
+
+    col4, col5 = st.columns(2)
+    with col4:
+        top_p = st.slider(
+            "Top-p (nucleus sampling)",
+            min_value=0.1,
+            max_value=1.0,
+            value=0.9,
+            step=0.05,
+            help=(
+                "Nucleus sampling: выбирает из минимального набора токенов, "
+                "чья суммарная вероятность ≥ top_p. Отсекает маловероятный «хвост».\n\n"
+                "В отличие от Top-k (фиксированное число токенов), Top-p адаптируется: "
+                "когда модель уверена — берёт мало токенов, когда неуверена — больше.\n\n"
+                "**0.7–0.8** → консервативно, только самые вероятные варианты.\n"
+                "**0.9** → хороший баланс, обрезает явно неуместные токены (default).\n"
+                "**0.95–1.0** → почти без фильтрации, максимальное разнообразие.\n\n"
+                "Рекомендации:\n"
+                "• 0.8 — структурированные, точные тексты\n"
+                "• 0.9 — универсальный вариант\n"
+                "• 1.0 — отключить Top-p, полагаться только на Top-k и Temperature\n\n"
+                "💡 Top-p применяется после Top-k как дополнительный фильтр."
+            )
+        )
+    with col5:
+        st.caption("")  # spacer
+
     # Генерация
     if st.button("✨ Сгенерировать", type="primary", width='stretch'):
         if not prompt.strip():
             st.warning("Введите промпт!")
             return
-        
-        app_logger.info(f"UI Генерация запущена: prompt='{prompt[:50]}...', max_tokens={max_tokens}, temp={temperature}, top_k={top_k}")
-        
+
+        app_logger.info(
+            f"UI Генерация запущена: prompt='{prompt[:50]}...', "
+            f"max_tokens={max_tokens}, temp={temperature}, top_k={top_k}, top_p={top_p}"
+        )
+
         with st.spinner("Генерация..."):
             try:
                 generated, stats = generate_text(
@@ -475,6 +734,7 @@ def tab_generation():
                     max_new_tokens=max_tokens,
                     temperature=temperature,
                     top_k=top_k,
+                    top_p=top_p,
                     device=device
                 )
                 
@@ -558,16 +818,370 @@ def tab_training():
         # Режим обучения
         training_mode = st.radio(
             "Режим обучения",
-            ["🆕 С нуля", "🔄 Дообучение (Fine-tuning)"],
+            ["🆕 С нуля", "🔄 Дообучение (Fine-tuning)", "🤖 MLX Fine-tuning"],
             disabled=training_state.active,
-            help="С нуля: новая модель | Дообучение: продолжить обучение существующей модели"
+            help=(
+                "**С нуля** — обучить новую GPT-модель на PyTorch с нуля.\n\n"
+                "**Дообучение** — продолжить обучение существующего PyTorch checkpoint.\n\n"
+                "**MLX Fine-tuning** — LoRA fine-tuning готовой предобученной модели (Llama, Qwen, ...) "
+                "на Apple Silicon через mlx-lm. Быстрее и эффективнее для специализации."
+            )
         )
-        
+
         is_finetuning = "Дообучение" in training_mode
-        
+        is_mlx = "MLX" in training_mode
+
+        # ═══════════════════════════════════════════════════════
+        # MLX Fine-tuning UI
+        # ═══════════════════════════════════════════════════════
+        # Default MLX variable values (used in run_training closure)
+        mlx_model_id = None
+        mlx_adapter_path = None
+        mlx_data_dir = None
+        mlx_source_path = None
+        mlx_lora_layers = 8
+        mlx_lora_rank = 8
+        mlx_lora_scale = 20.0
+        mlx_lora_dropout = 0.0
+        mlx_lr = 2e-5
+        mlx_batch_size_val = 4
+        mlx_iters = 500
+        mlx_max_seq_length = 1024
+        mlx_steps_per_eval = 100
+        mlx_save_every = 100
+        mlx_grad_checkpoint = False
+        mlx_format = "completion"
+        mlx_system_prompt = ""
+        mlx_clean_forum_data = False
+
+        if is_mlx:
+            from mlx_integration import (
+                MLX_AVAILABLE, CURATED_MODELS, get_model_display_label,
+                DataPrepConfig, prepare_mlx_dataset,
+            )
+
+            if not MLX_AVAILABLE:
+                st.error(
+                    "❌ **mlx-lm не установлен.**\n\n"
+                    "Установите командой:\n```\npoetry add mlx-lm\n```\n\n"
+                    "MLX работает только на Apple Silicon (M1/M2/M3/M4)."
+                )
+            else:
+                st.info("🍎 MLX Fine-tuning работает на Apple Silicon через LoRA адаптеры.")
+
+                # --- Выбор базовой модели ---
+                st.markdown("**🤖 Базовая модель**")
+                model_labels = [get_model_display_label(m) for m in CURATED_MODELS]
+                selected_model_label = st.selectbox(
+                    "Выберите модель",
+                    model_labels,
+                    index=0,
+                    disabled=training_state.active,
+                    help=(
+                        "Предобученная модель из mlx-community на HuggingFace.\n\n"
+                        "✅ = уже скачана в кеш (~/.cache/huggingface/)\n"
+                        "⬇️ = будет скачана при запуске (может занять несколько минут)\n\n"
+                        "Рекомендации:\n"
+                        "• Qwen2.5 1.5B или SmolLM2 1.7B — лучший баланс для форумных данных\n"
+                        "• Llama 3.2 1B — самый лёгкий вариант (~700 MB)\n"
+                        "• Модели 3B+ — лучшее качество, но больше памяти"
+                    ),
+                )
+                selected_model_idx = model_labels.index(selected_model_label)
+                selected_model = CURATED_MODELS[selected_model_idx]
+                mlx_model_id = selected_model.hf_id
+                st.caption(f"📋 {selected_model.description}")
+                st.caption(f"🔗 HF ID: `{mlx_model_id}` | Контекст: {selected_model.context_length:,} токенов")
+
+                use_custom_id = st.checkbox(
+                    "Использовать свой HuggingFace ID",
+                    value=False,
+                    disabled=training_state.active,
+                    help="Любая mlx-lm совместимая модель с HuggingFace (например mlx-community/...)",
+                )
+                if use_custom_id:
+                    mlx_model_id = st.text_input(
+                        "HuggingFace model ID",
+                        value=mlx_model_id,
+                        disabled=training_state.active,
+                        placeholder="mlx-community/Llama-3.2-1B-Instruct-4bit",
+                    )
+
+                # --- Данные ---
+                st.divider()
+                st.markdown("**📁 Данные для fine-tuning**")
+
+                mlx_data_dir_obj = Path(__file__).parent / "data"
+                mlx_file_options, mlx_file_paths, mlx_default_idx = get_training_file_options(mlx_data_dir_obj)
+
+                if mlx_file_options:
+                    mlx_selected_option = st.selectbox(
+                        "Исходный файл",
+                        mlx_file_options,
+                        index=mlx_default_idx,
+                        disabled=training_state.active,
+                        help="Файл .txt или .json из директории data/ для конвертации в JSONL",
+                        key="mlx_data_select",
+                    )
+                    if mlx_selected_option == "✏️ Ввести путь вручную...":
+                        mlx_source_path = st.text_input(
+                            "Путь к файлу",
+                            value="data/",
+                            disabled=training_state.active,
+                            key="mlx_manual_data_path",
+                        )
+                    else:
+                        mlx_source_path = mlx_file_paths.get(mlx_selected_option, "")
+                        st.caption(f"📁 Путь: `{mlx_source_path}`")
+                else:
+                    mlx_source_path = st.text_input(
+                        "Путь к данным",
+                        value="data/sample.txt",
+                        disabled=training_state.active,
+                    )
+
+                col_fmt1, col_fmt2 = st.columns(2)
+                with col_fmt1:
+                    mlx_format = st.radio(
+                        "Формат JSONL",
+                        ["completion", "chat"],
+                        horizontal=True,
+                        disabled=training_state.active,
+                        help=(
+                            "**completion** — `{\"text\": \"...\"}`\n"
+                            "Весь текст как одна последовательность. Проще, подходит для общего fine-tuning.\n\n"
+                            "**chat** — `{\"messages\": [{role, content}, ...]}`\n"
+                            "Структура диалога system/user/assistant. Лучше для instruction-следования."
+                        ),
+                    )
+                with col_fmt2:
+                    mlx_clean_forum_data = st.checkbox(
+                        "🧹 Очистить форумный шум",
+                        value=False,
+                        disabled=training_state.active,
+                        help="Удаляет никнеймы и форумные метки перед конвертацией",
+                    )
+
+                if mlx_format == "chat":
+                    mlx_system_prompt = st.text_area(
+                        "System prompt (опционально)",
+                        value="",
+                        height=80,
+                        disabled=training_state.active,
+                        placeholder="Например: Ты опытный участник форума по химии.",
+                        help="Добавляется как system-сообщение в каждый chat-пример.",
+                    )
+                else:
+                    mlx_system_prompt = ""
+
+                mlx_max_seq_length = st.number_input(
+                    "Max sequence length",
+                    min_value=128,
+                    max_value=4096,
+                    value=1024,
+                    step=128,
+                    disabled=training_state.active,
+                    help=(
+                        "Максимальная длина последовательности токенов в одном примере.\n\n"
+                        "Тексты длиннее этого значения будут разбиты на несколько примеров.\n\n"
+                        "Рекомендации:\n"
+                        "• 512–1024 — для коротких форумных сообщений\n"
+                        "• 2048 — для длинных текстов\n\n"
+                        "⚠️ Большие значения требуют больше памяти при обучении."
+                    ),
+                )
+
+                # JSONL output directory
+                mlx_data_dir = str(
+                    Path(__file__).parent / "data" / "mlx_jsonl" /
+                    (Path(mlx_source_path).stem if mlx_source_path else "dataset")
+                )
+                mlx_train_jsonl = Path(mlx_data_dir) / "train.jsonl"
+                mlx_data_prepped = mlx_train_jsonl.exists()
+
+                if mlx_data_prepped:
+                    line_count = sum(1 for _ in open(mlx_train_jsonl, encoding="utf-8"))
+                    st.success(f"✅ JSONL готов: `{mlx_data_dir}` ({line_count} train примеров)")
+                else:
+                    st.warning(f"⚠️ JSONL не подготовлен. Нажмите кнопку ниже.")
+
+                if st.button(
+                    "🔄 Подготовить данные → JSONL",
+                    disabled=training_state.active or not mlx_source_path,
+                    help="Конвертирует исходный файл в train.jsonl + valid.jsonl для mlx_lm",
+                ):
+                    with st.spinner("Подготовка данных..."):
+                        try:
+                            prep_config = DataPrepConfig(
+                                source_path=mlx_source_path,
+                                output_dir=mlx_data_dir,
+                                format=mlx_format,
+                                system_prompt=mlx_system_prompt,
+                                max_seq_length=mlx_max_seq_length,
+                                clean_forum=mlx_clean_forum_data,
+                            )
+                            stats = prepare_mlx_dataset(prep_config)
+                            st.success(
+                                f"✅ Готово! Train: {stats['train_count']} примеров, "
+                                f"Valid: {stats['valid_count']} примеров"
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Ошибка подготовки данных: {e}")
+
+                # --- LoRA параметры ---
+                st.divider()
+                with st.expander("⚙️ LoRA параметры", expanded=False):
+                    lora_col1, lora_col2 = st.columns(2)
+                    with lora_col1:
+                        mlx_lora_layers = st.number_input(
+                            "LoRA Layers",
+                            min_value=1,
+                            max_value=32,
+                            value=8,
+                            disabled=training_state.active,
+                            help=(
+                                "Сколько последних слоёв трансформера адаптировать через LoRA.\n\n"
+                                "Больше слоёв = больше обучаемых параметров, но медленнее.\n\n"
+                                "Рекомендации: 4–8 для маленьких моделей, 8–16 для больших."
+                            ),
+                        )
+                        mlx_lora_rank = st.number_input(
+                            "LoRA Rank",
+                            min_value=1,
+                            max_value=64,
+                            value=8,
+                            disabled=training_state.active,
+                            help=(
+                                "Ранг матриц LoRA. Определяет ёмкость адаптера.\n\n"
+                                "**Низкий rank (4–8)** → меньше параметров, быстрее, риск underfitting.\n"
+                                "**Высокий rank (16–32)** → больше параметров, медленнее, лучше качество.\n\n"
+                                "Рекомендации: 8 — хороший баланс для большинства задач."
+                            ),
+                        )
+                        mlx_lora_scale = st.number_input(
+                            "LoRA Scale",
+                            min_value=1.0,
+                            max_value=100.0,
+                            value=20.0,
+                            step=5.0,
+                            disabled=training_state.active,
+                            help=(
+                                "Масштаб LoRA = alpha / rank. Управляет силой обновлений адаптера.\n\n"
+                                "Обычно устанавливается равным rank или вдвое больше.\n\n"
+                                "Рекомендации: 10–20 для стандартного fine-tuning."
+                            ),
+                        )
+                        mlx_lora_dropout = st.number_input(
+                            "LoRA Dropout",
+                            min_value=0.0,
+                            max_value=0.5,
+                            value=0.0,
+                            step=0.05,
+                            format="%.2f",
+                            disabled=training_state.active,
+                            help=(
+                                "Dropout внутри LoRA слоёв для регуляризации.\n\n"
+                                "0.0 — без dropout (стандарт для маленьких датасетов).\n"
+                                "0.05–0.1 — лёгкая регуляризация при переобучении."
+                            ),
+                        )
+                    with lora_col2:
+                        mlx_lr = st.number_input(
+                            "Learning rate",
+                            min_value=1e-6,
+                            max_value=1e-3,
+                            value=2e-5,
+                            format="%.1e",
+                            disabled=training_state.active,
+                            help=(
+                                "Learning rate для LoRA fine-tuning.\n\n"
+                                "Значительно меньше, чем при обучении с нуля.\n\n"
+                                "Рекомендации:\n"
+                                "• 1e-5 — консервативный\n"
+                                "• 2e-5 — стандарт (default)\n"
+                                "• 5e-5 — более агрессивный"
+                            ),
+                        )
+                        mlx_batch_size_val = st.number_input(
+                            "Batch size",
+                            min_value=1,
+                            max_value=16,
+                            value=4,
+                            disabled=training_state.active,
+                            help=(
+                                "Размер батча для LoRA обучения.\n\n"
+                                "Рекомендации:\n"
+                                "• 2–4 — для моделей 1–2B при 8–16 GB памяти\n"
+                                "• 1 — если не хватает памяти (включите grad checkpoint)\n\n"
+                                "💡 Используйте grad checkpoint для экономии памяти при малом батче."
+                            ),
+                        )
+                        mlx_iters = st.number_input(
+                            "Iterations",
+                            min_value=50,
+                            max_value=5000,
+                            value=500,
+                            step=50,
+                            disabled=training_state.active,
+                            help=(
+                                "Количество шагов обучения (не эпох).\n\n"
+                                "В отличие от PyTorch-обучения, mlx-lm считает шаги, а не эпохи.\n\n"
+                                "Рекомендации:\n"
+                                "• 200–300 — быстрый тест\n"
+                                "• 500 — стандарт (default)\n"
+                                "• 1000+ — полноценное обучение\n\n"
+                                "💡 Один шаг = один батч. "
+                                "Общий объём данных = iters × batch_size × max_seq_length."
+                            ),
+                        )
+                        mlx_steps_per_eval = st.number_input(
+                            "Steps per eval",
+                            min_value=10,
+                            max_value=500,
+                            value=100,
+                            step=10,
+                            disabled=training_state.active,
+                            help="Как часто оценивать val loss (в шагах).",
+                        )
+                        mlx_save_every = st.number_input(
+                            "Save every",
+                            min_value=10,
+                            max_value=500,
+                            value=100,
+                            step=10,
+                            disabled=training_state.active,
+                            help="Как часто сохранять промежуточный адаптер (в шагах).",
+                        )
+                        mlx_grad_checkpoint = st.checkbox(
+                            "Gradient checkpointing",
+                            value=False,
+                            disabled=training_state.active,
+                            help=(
+                                "Экономит память за счёт пересчёта активаций при backprop.\n\n"
+                                "Включайте, если не хватает памяти для выбранного batch size. "
+                                "Обучение станет немного медленнее (~20–30%)."
+                            ),
+                        )
+
+                # --- Название адаптера ---
+                st.divider()
+                st.session_state.setdefault("mlx_adapter_name", "my_style")
+                mlx_adapter_name = st.text_input(
+                    "📝 Название адаптера",
+                    disabled=training_state.active,
+                    key="mlx_adapter_name",
+                    help=(
+                        "Адаптер будет сохранён в adapters/{название}/\n\n"
+                        "После обучения можно слить с базовой моделью (Fuse) "
+                        "для получения автономной модели."
+                    ),
+                )
+                mlx_adapter_path = str(Path(__file__).parent / "adapters" / mlx_adapter_name) if mlx_adapter_name else None
+
         # Выбор checkpoint для дообучения
         checkpoint_to_load = None
-        if is_finetuning:
+        if is_finetuning and not is_mlx:
             st.divider()
             st.caption("**📥 Загрузка существующей модели:**")
             
@@ -601,16 +1215,60 @@ def tab_training():
             
             st.divider()
         
+        # ═══════════════════════════════════════════════════════
+        # PyTorch-specific UI (hidden in MLX mode)
+        # ═══════════════════════════════════════════════════════
+        # Placeholder values so the run_training closure compiles in MLX mode
+        if is_mlx:
+            config_size = None
+            data_path = ""
+            epochs = 0
+            batch_size = 4
+            context_len = 256
+            lr = 2e-5
+            patience = 15
+            min_epochs = 20
+            dropout = 0.1
+            weight_decay = 0.01
+            grad_clip = 1.0
+            warmup_steps = 200
+            gradient_accumulation_steps = 1
+            min_delta = 0.01
+            checkpoint_interval = 500
+            stride = None
+            clean_forum = False
+            tokenizer_type = "bpe"
+            tokenizer_encoding = None
+            bpe_vocab_size = 8000
+            bpe_min_frequency = 2
+            model_name = st.session_state.get("mlx_adapter_name", "my_adapter")
+
         # Размер модели (только для обучения с нуля)
-        if not is_finetuning:
+        if not is_finetuning and not is_mlx:
             config_size = st.selectbox(
                 "Размер модели",
                 ["small", "medium", "base"],
                 index=0,
-                help="small: ~13M params, medium: ~50M params, base: ~117M params",
+                help=(
+                "Архитектурный размер модели — определяет количество параметров, "
+                "слоёв и размерность эмбеддингов.\n\n"
+                "**small** (~13M параметров)\n"
+                "d_model=256, layers=4, heads=4, context=256\n"
+                "Быстрое обучение, мало памяти. Подходит для экспериментов "
+                "и небольших датасетов (<1 MB).\n\n"
+                "**medium** (~50M параметров)\n"
+                "d_model=512, layers=6, heads=8, context=512\n"
+                "Хороший баланс качества и скорости. Оптимален для корпусов 1–10 MB.\n\n"
+                "**base** (~117M параметров, как GPT-2 small)\n"
+                "d_model=768, layers=12, heads=12, context=1024\n"
+                "Максимальное качество, но требует много памяти и времени. "
+                "Рекомендуется от 10 MB данных.\n\n"
+                "⚠️ Чем больше модель, тем больше данных нужно для хорошего обучения. "
+                "На маленьком датасете большая модель переобучится быстрее."
+            ),
                 disabled=training_state.active
             )
-        else:
+        elif is_finetuning and not is_mlx:
             # При дообучении размер определяется checkpoint
             config_size = None
             st.info("💡 Архитектура модели будет загружена из checkpoint")
@@ -629,11 +1287,11 @@ def tab_training():
         else:
             selected_data_path_for_defaults = "data/sample.txt"
 
-        tokenizer_type_for_defaults = "char" if is_finetuning else st.session_state.get("training_tokenizer_type", "tiktoken")
+        tokenizer_type_for_defaults = "char" if is_finetuning else st.session_state.get("training_tokenizer_type", "hybrid")
         default_advice = build_training_data_advice(
             selected_data_path_for_defaults,
             tokenizer_type_for_defaults,
-            128,
+            256,
             32,
         )
 
@@ -666,27 +1324,69 @@ def tab_training():
             "Количество эпох" if not is_finetuning else "Дополнительные эпохи", 
             min_value=1, 
             max_value=100, 
-            value=5 if is_finetuning else 3,
+            value=10 if is_finetuning else 30,
             disabled=training_state.active,
-            help="Для дообучения обычно достаточно 3-10 эпох" if is_finetuning else None
+            help=(
+                "Сколько раз модель пройдёт через весь датасет целиком.\n\n"
+                "Одна эпоха = один полный проход по всем обучающим батчам. "
+                "После каждой эпохи веса модели обновляются, и она «видела» все данные ещё раз.\n\n"
+                "**Мало эпох** → недообучение: модель не успела выучить паттерны.\n"
+                "**Много эпох** → риск переобучения: модель запоминает данные наизусть, "
+                "val loss растёт при хорошем train loss.\n\n"
+                "Рекомендации:\n"
+                "• 10–20 — быстрый эксперимент\n"
+                "• 30–50 — стандартное обучение с early stopping (default 30)\n"
+                "• 50–100 — маленький датасет, когда нужно много проходов\n\n"
+                "💡 С включённым early stopping обучение остановится автоматически "
+                "при отсутствии прогресса — можно смело ставить большое значение."
+            ) if not is_finetuning else (
+                "Сколько дополнительных эпох пройти поверх уже обученной модели.\n\n"
+                "При дообучении веса уже хорошо инициализированы, поэтому "
+                "нужно гораздо меньше эпох, чем при обучении с нуля.\n\n"
+                "Рекомендации:\n"
+                "• 3–5 — лёгкая адаптация к новым данным\n"
+                "• 5–10 — стандартное дообучение (default)\n"
+                "• 10+ — значительное изменение домена или большой новый датасет\n\n"
+                "⚠️ Слишком много эпох при дообучении может привести к «забыванию» "
+                "исходных знаний модели (catastrophic forgetting)."
+            )
         )
         
+        st.session_state.setdefault("train_batch_size", 32)
         batch_size = st.number_input(
-            "Batch size", 
-            min_value=1, 
-            max_value=128, 
-            value=32,
+            "Batch size",
+            min_value=1,
+            max_value=128,
             disabled=training_state.active,
-            key="train_batch_size"
+            key="train_batch_size",
+            help=(
+                "Количество обучающих примеров, обрабатываемых за один шаг.\n\n"
+                "**Больше** → стабильнее градиенты, быстрее эпоха, но больше памяти.\n"
+                "**Меньше** → больший «шум» в градиентах (иногда помогает избежать локальных минимумов), меньше памяти.\n\n"
+                "Рекомендации:\n"
+                "• 8–16 — маленький датасет или мало памяти\n"
+                "• 32 — хороший баланс (default)\n"
+                "• 64–128 — если памяти достаточно и датасет большой\n\n"
+                "⚠️ Если не хватает памяти GPU/MPS — уменьшите batch size или увеличьте Gradient Accumulation Steps."
+            )
         )
-        
+
+        st.session_state.setdefault("train_context_len", 256)
         context_len = st.number_input(
             "Context Length",
             min_value=16,
             max_value=1024,
-            value=128,
             step=16,
-            help="Длина контекста (окно токенов). Уменьшите для маленьких датасетов!",
+            help=(
+                "Максимальная длина последовательности токенов, которую модель видит за один раз.\n\n"
+                "**Больше** → модель улавливает более длинные зависимости в тексте, но квадратично растёт память (attention).\n"
+                "**Меньше** → быстрее обучение, меньше памяти, но модель «не видит» дальний контекст.\n\n"
+                "Рекомендации:\n"
+                "• 64–128 — очень маленький датасет (<100 KB)\n"
+                "• 256 — хороший баланс для корпусов 0.5–5 MB (default)\n"
+                "• 512–1024 — большой датасет, достаточно памяти\n\n"
+                "⚠️ Если датасет мал, слишком большой context_len даёт мало обучающих окон — модель быстро переобучается."
+            ),
             disabled=training_state.active,
             key="train_context_len"
         )
@@ -695,9 +1395,19 @@ def tab_training():
             "Learning rate",
             min_value=1e-5,
             max_value=1e-2,
-            value=3e-4,
+            value=1.5e-4,
             format="%.5f",
-            help="Рекомендуется 3e-4 для трансформеров",
+            help=(
+                "Скорость обновления весов модели на каждом шаге оптимизатора.\n\n"
+                "**Больше** → быстрее обучение, но риск нестабильности (loss «прыгает» или расходится).\n"
+                "**Меньше** → стабильнее, но обучение медленнее и можно застрять в локальном минимуме.\n\n"
+                "Рекомендации:\n"
+                "• 3e-4 — агрессивный старт, хорошо с warmup\n"
+                "• 1e-4 .. 1.5e-4 — надёжный диапазон для трансформеров (default)\n"
+                "• 1e-5 .. 5e-5 — дообучение (fine-tuning) поверх существующей модели\n\n"
+                "💡 Используйте Warmup Steps для плавного разгона от 0 до целевого LR — "
+                "это защищает от расходимости в начале обучения."
+            ),
             disabled=training_state.active
         )
         
@@ -705,17 +1415,40 @@ def tab_training():
             "Early stopping patience",
             min_value=1,
             max_value=50,
-            value=10,
-            help="Остановка после N проверок без улучшения val_loss. Проверка каждые 200 шагов. Рекомендуется 10-20.",
+            value=15,
+            help=(
+                "Сколько проверок val_loss подряд без улучшения допустимо перед остановкой обучения.\n\n"
+                "Проверка происходит каждые 150 шагов. При patience=15 обучение остановится, "
+                "если val_loss не улучшился на протяжении 15 × 150 = 2250 шагов.\n\n"
+                "**Маленькое значение** → быстрая остановка, риск недообучить модель.\n"
+                "**Большое значение** → модель дольше ищет оптимум, но можно потратить время впустую.\n\n"
+                "Рекомендации:\n"
+                "• 5–10 — если датасет большой и эпохи длинные\n"
+                "• 15 — хороший баланс (default)\n"
+                "• 20–30 — если датасет маленький и loss медленно сходится\n\n"
+                "💡 Используйте вместе с «Минимальное количество эпох», чтобы модель "
+                "гарантированно прошла начальный этап обучения перед возможной остановкой."
+            ),
             disabled=training_state.active
         )
-        
+
         min_epochs = st.number_input(
             "Минимальное количество эпох",
             min_value=0,
             max_value=epochs if epochs else 10,
-            value=0,
-            help="Гарантированное минимальное количество эпох. Early stopping не сработает до завершения этих эпох. Установите 3 для гарантии минимум 3 эпох.",
+            value=20,
+            help=(
+                "Гарантированное число эпох до того, как early stopping сможет остановить обучение.\n\n"
+                "В начале обучения val_loss часто нестабилен: он может временно расти, "
+                "хотя модель ещё не сошлась. Без этого ограничения early stopping может "
+                "сработать слишком рано и прервать обучение до достижения хорошего качества.\n\n"
+                "Рекомендации:\n"
+                "• 0 — early stopping может сработать с первых шагов (не рекомендуется)\n"
+                "• 10 — минимальный порог для коротких экспериментов\n"
+                "• 20 — хороший баланс (default)\n"
+                "• 30+ — для маленьких датасетов, где модели нужно больше времени на разгон\n\n"
+                "⚠️ Значение не должно превышать общее количество эпох."
+            ),
             disabled=training_state.active
         )
         
@@ -725,7 +1458,18 @@ def tab_training():
             max_value=0.5,
             value=0.1,
             step=0.05,
-            help="🛡️ Regularization: случайно выключает нейроны во время обучения. Помогает бороться с overfitting (когда train loss хороший, но val loss растет). Рекомендуется 0.1-0.2 для трансформеров.",
+            help=(
+                "Вероятность случайного «выключения» нейрона во время каждого шага обучения.\n\n"
+                "Это регуляризация: модель не может полагаться на конкретные нейроны и вынуждена "
+                "учить более общие признаки. Во время инференса dropout автоматически отключается.\n\n"
+                "**Симптом overfitting:** train loss падает, а val loss растёт — увеличьте dropout.\n\n"
+                "Рекомендации:\n"
+                "• 0.0 — без регуляризации (риск overfitting на малых датасетах)\n"
+                "• 0.05 — лёгкая регуляризация для корпусов 1–10 MB\n"
+                "• 0.1 — стандарт для трансформеров (default)\n"
+                "• 0.2–0.3 — сильная регуляризация, если явный overfitting\n\n"
+                "⚠️ При дообучении (fine-tuning) dropout берётся из загруженного checkpoint."
+            ),
             disabled=training_state.active or is_finetuning
         )
         
@@ -744,7 +1488,20 @@ def tab_training():
                     value=0.01,
                     step=0.01,
                     format="%.3f",
-                    help="L2 regularization для весов модели. Помогает предотвратить overfitting. Рекомендуется 0.01-0.1.",
+                    help=(
+                        "L2-регуляризация: штраф за слишком большие веса модели. "
+                        "На каждом шаге веса немного «тянутся» к нулю, что мешает модели "
+                        "запомнить обучающие данные наизусть.\n\n"
+                        "В отличие от Dropout (случайное выключение нейронов), Weight Decay "
+                        "действует постоянно и равномерно на все веса.\n\n"
+                        "**Симптом overfitting:** большой разрыв между train loss и val loss — "
+                        "попробуйте увеличить weight decay.\n\n"
+                        "Рекомендации:\n"
+                        "• 0.0 — без регуляризации\n"
+                        "• 0.01 — стандарт для трансформеров (default)\n"
+                        "• 0.05–0.1 — если явный overfitting\n\n"
+                        "💡 Weight Decay и Dropout дополняют друг друга — можно использовать оба."
+                    ),
                     disabled=training_state.active
                 )
                 
@@ -755,7 +1512,20 @@ def tab_training():
                     value=1.0,
                     step=0.1,
                     format="%.1f",
-                    help="Максимальная норма градиентов. Предотвращает exploding gradients. Рекомендуется 1.0.",
+                    help=(
+                        "Максимально допустимая норма вектора градиентов перед обновлением весов.\n\n"
+                        "Если норма градиентов превышает это значение, они масштабируются вниз "
+                        "пропорционально. Это защищает от «взрывного» роста градиентов (exploding "
+                        "gradients), когда один неудачный батч может резко испортить все веса модели.\n\n"
+                        "**Симптом проблемы:** loss внезапно скачет вверх или уходит в NaN — "
+                        "уменьшите grad clip или learning rate.\n\n"
+                        "Рекомендации:\n"
+                        "• 1.0 — стандарт для трансформеров, подходит в большинстве случаев (default)\n"
+                        "• 0.5 — более агрессивное ограничение, если обучение нестабильно\n"
+                        "• 2.0–5.0 — мягкое ограничение, если градиенты в норме\n\n"
+                        "💡 Gradient Clipping не замедляет обучение — он срабатывает только в "
+                        "аномальных ситуациях."
+                    ),
                     disabled=training_state.active
                 )
                 
@@ -763,9 +1533,20 @@ def tab_training():
                     "Warmup Steps",
                     min_value=0,
                     max_value=2000,
-                    value=100,
+                    value=200,
                     step=50,
-                    help="Количество шагов для плавного увеличения learning rate от 0 до целевого значения. Стабилизирует начало обучения. Рекомендуется 100-500.",
+                    help=(
+                        "Число шагов, в течение которых learning rate плавно растёт от 0 до целевого значения.\n\n"
+                        "В самом начале обучения веса случайны, градиенты нестабильны — "
+                        "большой LR может сразу «разогнать» модель в неудачном направлении. "
+                        "Warmup даёт модели время «освоиться» перед полноценным обучением.\n\n"
+                        "После warmup LR плавно снижается по косинусному расписанию до конца обучения.\n\n"
+                        "Рекомендации:\n"
+                        "• 0 — без warmup (риск нестабильности в начале)\n"
+                        "• 100–200 — маленький датасет или короткое обучение (default)\n"
+                        "• 300–500 — большой датасет, длинное обучение\n\n"
+                        "💡 Хорошее правило: warmup ≈ 1–5% от общего числа шагов обучения."
+                    ),
                     disabled=training_state.active
                 )
             
@@ -776,7 +1557,22 @@ def tab_training():
                     max_value=16,
                     value=1,
                     step=1,
-                    help="Накопление градиентов перед обновлением весов. Эффективно увеличивает batch size без доп. памяти. Полезно если batch_size ограничен памятью GPU.",
+                    help=(
+                        "Количество шагов, на протяжении которых градиенты накапливаются перед "
+                        "обновлением весов модели.\n\n"
+                        "Эффективный batch size = batch_size × gradient_accumulation_steps. "
+                        "То есть при batch_size=16 и accumulation=4 модель обновляется так, "
+                        "как если бы batch был 64 — но без дополнительных затрат памяти.\n\n"
+                        "**Когда использовать:**\n"
+                        "• Не хватает памяти GPU/MPS для большого batch size\n"
+                        "• Хочется стабильности больших батчей при ограниченном железе\n\n"
+                        "Рекомендации:\n"
+                        "• 1 — без накопления (default, если памяти достаточно)\n"
+                        "• 2–4 — умеренное увеличение эффективного batch size\n"
+                        "• 8–16 — если batch_size вынужденно маленький (4–8)\n\n"
+                        "⚠️ Скорость обучения снижается пропорционально: при accumulation=4 "
+                        "один «настоящий» шаг занимает в 4 раза больше времени."
+                    ),
                     disabled=training_state.active
                 )
                 
@@ -787,7 +1583,20 @@ def tab_training():
                     value=0.01,
                     step=0.005,
                     format="%.3f",
-                    help="Минимальное улучшение val_loss для сброса счетчика early stopping. Рекомендуется 0.01.",
+                    help=(
+                        "Минимальное улучшение val_loss, которое считается «настоящим» прогрессом "
+                        "и сбрасывает счётчик patience.\n\n"
+                        "Без этого порога даже улучшение на 0.0001 сбрасывало бы счётчик, "
+                        "и обучение продолжалось бы бесконечно при очень медленном сходжении.\n\n"
+                        "Пример: при min_delta=0.01 и patience=15 обучение остановится, если "
+                        "val_loss не снизился хотя бы на 0.01 за последние 15 проверок.\n\n"
+                        "Рекомендации:\n"
+                        "• 0.0 — любое улучшение считается прогрессом\n"
+                        "• 0.005–0.01 — стандартный порог (default)\n"
+                        "• 0.02–0.05 — если хотите останавливаться только при значимом прогрессе\n\n"
+                        "⚠️ Слишком большое значение может привести к преждевременной остановке, "
+                        "если модель сходится медленно, но стабильно."
+                    ),
                     disabled=training_state.active
                 )
                 
@@ -797,21 +1606,97 @@ def tab_training():
                     max_value=2000,
                     value=500,
                     step=100,
-                    help="Сохранять checkpoint каждые N шагов. Рекомендуется 500.",
+                    help=(
+                        "Как часто сохранять промежуточный checkpoint на диск (в шагах).\n\n"
+                        "Помимо этих периодических сохранений, лучший checkpoint по val_loss "
+                        "всегда сохраняется автоматически как `{название}_best.pt`.\n\n"
+                        "**Зачем нужны промежуточные checkpoint'ы:**\n"
+                        "• Защита от прерывания обучения (сбой, выключение)\n"
+                        "• Возможность вернуться к более ранней версии модели\n"
+                        "• Продолжение обучения с любой точки через --continue-from\n\n"
+                        "Рекомендации:\n"
+                        "• 200–300 — короткие эксперименты или нестабильное обучение\n"
+                        "• 500 — хороший баланс (default)\n"
+                        "• 1000+ — длинное обучение, когда дисковое место ограничено\n\n"
+                        "⚠️ Частое сохранение замедляет обучение и занимает место на диске."
+                    ),
                     disabled=training_state.active
                 )
-        
+
+                stride = st.number_input(
+                    "Dataset Stride",
+                    min_value=0,
+                    max_value=2048,
+                    value=0,
+                    step=16,
+                    help=(
+                        "Шаг (в токенах) между соседними обучающими окнами при нарезке датасета.\n\n"
+                        "Датасет нарезается на окна длиной context_len. Stride определяет, "
+                        "насколько каждое следующее окно сдвигается относительно предыдущего.\n\n"
+                        "• **0 (авто)** — окна не перекрываются (stride = context_len). "
+                        "Максимальная скорость, минимум окон.\n"
+                        "• **context_len // 2** — окна перекрываются наполовину, вдвое больше "
+                        "обучающих примеров из того же текста.\n"
+                        "• **Меньше stride** → больше окон, но соседние окна сильно похожи друг на друга.\n\n"
+                        "Рекомендации:\n"
+                        "• 0 — большой датасет, окон и так достаточно\n"
+                        "• context_len // 2 — маленький датасет (<2 MB), нужно больше обучающих примеров\n\n"
+                        "Пример: context_len=256, stride=128 → ~2× больше окон, каждое соседнее "
+                        "окно делит половину токенов с предыдущим."
+                    ),
+                    disabled=training_state.active
+                )
+                stride = stride if stride > 0 else None
+
+            clean_forum = st.checkbox(
+                "🧹 Очистить форумный шум",
+                value=False,
+                help=(
+                    "Удаляет форумный «шум» из текста перед обучением: имена авторов, "
+                    "никнеймы вида `username#:` и строки вида `Имя Фамилия:`.\n\n"
+                    "Форумные данные часто содержат паттерны вида:\n"
+                    "```\nИванов123: Привет всем!\nPetrov#42: А я думаю...\n```\n"
+                    "Модель начинает запоминать эти имена как часть языка, что ухудшает "
+                    "качество генерации на нефорумных текстах.\n\n"
+                    "**Что сохраняется** (семантически значимые префиксы):\n"
+                    "• Вопрос:, Ответ:, Задача:, Решение:, Тема:, Пример:, Примечание:\n\n"
+                    "**Что удаляется:**\n"
+                    "• Произвольные имена и никнеймы перед двоеточием\n"
+                    "• Строки вида `username#:` (форумный формат)\n\n"
+                    "💡 Включайте, если датасет содержит форумные обсуждения или чаты."
+                ),
+                disabled=training_state.active
+            )
+
         # Токенизатор
         tokenizer_type = st.selectbox(
             "Тип токенизатора",
-            options=["char", "hybrid", "tiktoken"],
+            options=["char", "hybrid", "bpe", "tiktoken"],
             index=1 if not is_finetuning else 0,  # hybrid по умолчанию для новых моделей
             format_func=lambda x: {
                 "char": "Character-level (legacy, 1 символ = 1 токен)",
                 "hybrid": "Hybrid chemistry (доменные токены + fallback char)",
+                "bpe": "BPE trainable (рекомендуемо 4k-16k словарь)",
                 "tiktoken": "TikToken BPE (быстро, эффективно, GPT-4 tokenizer)"
             }[x],
-            help="Для химии: hybrid обычно стабильнее char и легче tiktoken на малых корпусах.",
+            help=(
+                "Определяет, как текст разбивается на токены — единицы, с которыми работает модель.\n\n"
+                "**char** — каждый символ = один токен. Маленький словарь (~200–300 токенов), "
+                "но длинные последовательности. Модель учится с нуля на уровне букв. "
+                "Подходит для экспериментов, устарел для практики.\n\n"
+                "**hybrid** — доменные токены (химические формулы, термины) + char-fallback. "
+                "Оптимален для научных и специализированных текстов. Словарь ~8k–12k токенов.\n\n"
+                "**bpe** — обучаемый BPE (Byte Pair Encoding) на вашем корпусе. "
+                "Строит словарь из наиболее частых подслов. Гибкий, но требует времени на обучение. "
+                "Словарь 4k–16k токенов.\n\n"
+                "**tiktoken** — готовый BPE от OpenAI (GPT-4). Не обучается на вашем корпусе, "
+                "зато очень быстрый и эффективен для русского языка. Словарь ~100k токенов.\n\n"
+                "Рекомендации:\n"
+                "• Научный/химический текст → **hybrid**\n"
+                "• Русский общий текст → **tiktoken** или **bpe**\n"
+                "• Эксперименты/отладка → **char**\n\n"
+                "⚠️ При дообучении токенизатор берётся из checkpoint и не меняется."
+            ),
             disabled=training_state.active or is_finetuning,
             key="training_tokenizer_type"
         )
@@ -831,6 +1716,56 @@ def tab_training():
             )
         else:
             tokenizer_encoding = None
+
+        if tokenizer_type == "bpe":
+            bpe_vocab_size = st.select_slider(
+                "BPE vocab size",
+                options=[4000, 6000, 8000, 12000, 16000],
+                value=8000,
+                help=(
+                    "Целевое количество токенов в словаре BPE-токенизатора.\n\n"
+                    "BPE (Byte Pair Encoding) итеративно объединяет наиболее частые пары символов "
+                    "в один токен. Размер словаря определяет, насколько крупными будут токены.\n\n"
+                    "**Маленький словарь (4k)** → токены короче, последовательности длиннее, "
+                    "модель видит меньше контекста за раз. Хуже для редких слов.\n\n"
+                    "**Большой словарь (12k–16k)** → токены крупнее, последовательности короче, "
+                    "но требует больше данных для обучения токенизатора.\n\n"
+                    "Рекомендации:\n"
+                    "• 4000 — очень маленький датасет (<500 KB)\n"
+                    "• 6000–8000 — датасет 0.5–5 MB (default)\n"
+                    "• 12000–16000 — датасет >5 MB, богатый словарный состав\n\n"
+                    "💡 Хорошее правило: vocab_size ≈ √(количество уникальных слов в корпусе). "
+                    "Слишком большой словарь при малом корпусе приведёт к токенам-одиночкам."
+                ),
+                disabled=training_state.active or is_finetuning,
+            )
+            bpe_min_frequency = st.number_input(
+                "BPE min frequency",
+                min_value=1,
+                max_value=20,
+                value=2,
+                step=1,
+                help=(
+                    "Минимальное количество раз, которое пара символов должна встретиться "
+                    "в корпусе, чтобы объединиться в один токен.\n\n"
+                    "BPE строит словарь, объединяя наиболее частые пары. Этот порог "
+                    "отфильтровывает редкие пары, которые встречаются случайно и не несут "
+                    "смысловой нагрузки.\n\n"
+                    "**Низкое значение (1–2)** → больше редких токенов в словаре, "
+                    "токенизатор лучше покрывает редкие слова, но словарь «засоряется».\n\n"
+                    "**Высокое значение (5–10)** → только частые, устойчивые токены. "
+                    "Чище, но редкие слова разбиваются на множество мелких кусков.\n\n"
+                    "Рекомендации:\n"
+                    "• 2 — стандарт, подходит для большинства корпусов (default)\n"
+                    "• 3–5 — большой корпус с богатым словарём\n"
+                    "• 1 — очень маленький корпус, чтобы не терять редкие слова\n\n"
+                    "⚠️ При дообучении параметр берётся из checkpoint и не меняется."
+                ),
+                disabled=training_state.active or is_finetuning,
+            )
+        else:
+            bpe_vocab_size = 8000
+            bpe_min_frequency = 2
         
         if is_finetuning:
             st.caption("⚠️ Токенизатор определяется загруженным checkpoint")
@@ -941,10 +1876,36 @@ def tab_training():
         
         # Название модели/эксперимента
         st.divider()
+        default_model_name = "chemistry_model" if "chemistry" in str(data_path).lower() else "my_model"
+
+        # В режиме дообучения подставляем базовое имя выбранного checkpoint без суффиксов
+        # (_best, _epoch_N, _step_N), чтобы сохранять под тем же именем.
+        if is_finetuning and checkpoint_to_load:
+            checkpoint_stem = Path(checkpoint_to_load).stem
+            default_model_name = re.sub(r'_(best|epoch_\d+|step_\d+)$', '', checkpoint_stem)
+
+            prev_auto_name = st.session_state.get("training_auto_model_name")
+            prev_checkpoint_name = st.session_state.get("training_model_name_source_checkpoint")
+            current_model_name = st.session_state.get("training_model_name")
+
+            should_apply_auto_name = (
+                current_model_name is None
+                or current_model_name == prev_auto_name
+                or prev_checkpoint_name != checkpoint_to_load
+            )
+
+            if should_apply_auto_name:
+                st.session_state.training_model_name = default_model_name
+                st.session_state.training_auto_model_name = default_model_name
+                st.session_state.training_model_name_source_checkpoint = checkpoint_to_load
+        elif "training_model_name" not in st.session_state:
+            st.session_state.training_model_name = default_model_name
+            st.session_state.training_auto_model_name = default_model_name
+
         model_name = st.text_input(
             "📝 Название модели",
-            value="chemistry_model" if "chemistry" in str(data_path).lower() else "my_model",
             disabled=training_state.active,
+            key="training_model_name",
             help="Уникальное имя для этой модели. Лучший checkpoint будет сохранен как {название}_best.pt"
         )
         
@@ -956,10 +1917,23 @@ def tab_training():
         device_options = ["auto", "mps", "cuda", "cpu"]
         default_idx = 0  # auto по умолчанию
         device = st.selectbox(
-            "Device", 
-            device_options, 
+            "Device",
+            device_options,
             index=default_idx,
-            disabled=training_state.active
+            disabled=training_state.active,
+            help=(
+                "Вычислительное устройство для обучения модели.\n\n"
+                "**auto** — автоматически выбирает лучшее доступное устройство "
+                "(MPS → CUDA → CPU). Рекомендуется (default).\n\n"
+                "**mps** — Apple Silicon (M1/M2/M3/M4). Использует unified memory, "
+                "значительно быстрее CPU. Доступно только на Mac с Apple Silicon.\n\n"
+                "**cuda** — NVIDIA GPU. Самый быстрый вариант при наличии. "
+                "Требует CUDA-совместимую видеокарту и установленный CUDA toolkit.\n\n"
+                "**cpu** — центральный процессор. Медленно, но работает везде. "
+                "Подходит для отладки или если GPU недоступен.\n\n"
+                "💡 Ориентировочная скорость: CUDA > MPS >> CPU. "
+                "На CPU обучение может быть в 10–50× медленнее, чем на GPU."
+            )
         )
         
         # Показываем конфиг модели
@@ -1004,11 +1978,22 @@ def tab_training():
         
         with button_col1:
             # Проверка готовности к запуску
-            can_start = not training_state.active and Path(data_path).exists() and model_name and model_name.strip()
-            if is_finetuning:
-                can_start = can_start and checkpoint_to_load is not None
-            
-            button_text = "▶️ Начать дообучение" if is_finetuning else "▶️ Начать обучение"
+            if is_mlx:
+                mlx_data_prepped_check = bool(
+                    mlx_data_dir and (Path(mlx_data_dir) / "train.jsonl").exists()
+                )
+                can_start = (
+                    not training_state.active
+                    and bool(mlx_model_id)
+                    and bool(mlx_adapter_path)
+                    and mlx_data_prepped_check
+                )
+                button_text = "▶️ Начать MLX Fine-tuning"
+            else:
+                can_start = not training_state.active and Path(data_path).exists() and model_name and model_name.strip()
+                if is_finetuning:
+                    can_start = can_start and checkpoint_to_load is not None
+                button_text = "▶️ Начать дообучение" if is_finetuning else "▶️ Начать обучение"
             
             start_button = st.button(
                 button_text,
@@ -1051,6 +2036,31 @@ def tab_training():
             
             # Запускаем обучение в отдельном потоке
             def run_training():
+                if is_mlx:
+                    # ═══════════════════════════════════════════════════════
+                    # MLX LoRA Fine-tuning
+                    # ═══════════════════════════════════════════════════════
+                    from mlx_integration import MLXTrainingConfig, run_mlx_training
+                    config = MLXTrainingConfig(
+                        model_id=mlx_model_id,
+                        adapter_path=mlx_adapter_path,
+                        data_dir=mlx_data_dir,
+                        lora_layers=mlx_lora_layers,
+                        lora_rank=mlx_lora_rank,
+                        lora_scale=mlx_lora_scale,
+                        lora_dropout=mlx_lora_dropout,
+                        learning_rate=mlx_lr,
+                        batch_size=mlx_batch_size_val,
+                        iters=mlx_iters,
+                        max_seq_length=mlx_max_seq_length,
+                        val_batches=25,
+                        steps_per_eval=mlx_steps_per_eval,
+                        save_every=mlx_save_every,
+                        grad_checkpoint=mlx_grad_checkpoint,
+                    )
+                    run_mlx_training(config, training_state)
+                    return  # run_mlx_training manages its own thread + training_state
+
                 try:
                     if is_finetuning and checkpoint_to_load:
                         # ═══════════════════════════════════════════════════════
@@ -1073,7 +2083,7 @@ def tab_training():
                             n_epochs=epochs,
                             data_path=data_path,
                             device=device if device != "auto" else get_device(),
-                            eval_every=200,
+                            eval_every=150,
                             save_every=checkpoint_interval,
                             log_every=50,
                             patience=patience,
@@ -1126,6 +2136,8 @@ def tab_training():
                                 ft_tokenizer_encoding = tokenizer_config.get('encoding_name', 'cl100k_base')
                             elif tokenizer_kind == 'hybrid':
                                 ft_tokenizer_type = 'hybrid'
+                            elif tokenizer_kind == 'bpe':
+                                ft_tokenizer_type = 'bpe'
                             elif tokenizer_kind == 'char':
                                 ft_tokenizer_type = 'char'
 
@@ -1142,8 +2154,12 @@ def tab_training():
                             batch_size=batch_size,
                             tokenizer_type=ft_tokenizer_type,
                             tokenizer_encoding=ft_tokenizer_encoding,
+                            bpe_vocab_size=int(tokenizer_config.get('vocab_size', 8000)) if isinstance(tokenizer_config, dict) else 8000,
+                            bpe_min_frequency=int(tokenizer_config.get('min_frequency', 2)) if isinstance(tokenizer_config, dict) else 2,
                             tokenizer_config=tokenizer_config if isinstance(tokenizer_config, dict) else None,
                             normalize_chemistry=True,
+                            stride=stride,
+                            clean_forum=clean_forum,
                         )
                         
                         vocab_size = tokenizer.vocab_size() if hasattr(tokenizer, 'vocab_size') else len(tokenizer.vocab)
@@ -1205,7 +2221,7 @@ def tab_training():
                             n_epochs=epochs,
                             data_path=data_path,
                             device=device if device != "auto" else get_device(),
-                            eval_every=200,
+                            eval_every=150,
                             save_every=checkpoint_interval,
                             log_every=50,
                             patience=patience,
@@ -1254,7 +2270,11 @@ def tab_training():
                             batch_size=model_config.batch_size,
                             tokenizer_type=tokenizer_type,
                             tokenizer_encoding=tokenizer_encoding if tokenizer_type == 'tiktoken' else 'cl100k_base',
+                            bpe_vocab_size=bpe_vocab_size,
+                            bpe_min_frequency=bpe_min_frequency,
                             normalize_chemistry=True,
+                            stride=stride,
+                            clean_forum=clean_forum,
                         )
                         
                         model_config.vocab_size = tokenizer.vocab_size() if hasattr(tokenizer, 'vocab_size') else len(tokenizer.vocab)
@@ -1361,28 +2381,74 @@ def tab_training():
             if training_state.active:
                 progress = training_state.metrics.get('progress', 0.0)
                 st.progress(progress)
-                
-                # Метрики в 3 колонки
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                with metric_col1:
-                    st.metric("Эпоха", f"{training_state.metrics['epoch']}")
-                    st.metric("Шаг", f"{training_state.metrics['step']}")
-                with metric_col2:
-                    st.metric("Train Loss", f"{training_state.metrics['train_loss']:.4f}")
-                    current_val = training_state.metrics['val_loss']
-                    st.metric("Val Loss", f"{current_val:.4f}")
-                with metric_col3:
-                    best_val = training_state.metrics.get('best_val_loss', float('inf'))
-                    if best_val < float('inf'):
-                        st.metric("Best Val Loss", f"{best_val:.4f}")
-                        # Индикатор - улучшается ли модель
-                        if current_val <= best_val:
-                            st.success("⭐ Новый рекорд!")
+
+                if is_mlx:
+                    # MLX progress: show step + losses
+                    mlx_step = training_state.metrics.get('step', 0)
+                    mlx_train_loss = training_state.metrics.get('train_loss', 0.0)
+                    mlx_val_loss = training_state.metrics.get('val_loss', 0.0)
+                    mlx_it_sec = training_state.metrics.get('it_per_sec', 0.0)
+
+                    m_col1, m_col2, m_col3 = st.columns(3)
+                    with m_col1:
+                        st.metric("Шаг", f"{mlx_step} / {mlx_iters}")
+                    with m_col2:
+                        st.metric("Train Loss", f"{mlx_train_loss:.4f}" if mlx_train_loss else "—")
+                        if mlx_val_loss:
+                            st.metric("Val Loss", f"{mlx_val_loss:.4f}")
+                    with m_col3:
+                        if mlx_it_sec:
+                            st.metric("Скорость", f"{mlx_it_sec:.1f} it/s")
+                else:
+                    # PyTorch progress
+                    metric_col1, metric_col2, metric_col3 = st.columns(3)
+                    with metric_col1:
+                        st.metric("Эпоха", f"{training_state.metrics['epoch']}")
+                        st.metric("Шаг", f"{training_state.metrics['step']}")
+                    with metric_col2:
+                        st.metric("Train Loss", f"{training_state.metrics['train_loss']:.4f}")
+                        current_val = training_state.metrics['val_loss']
+                        st.metric("Val Loss", f"{current_val:.4f}")
+                    with metric_col3:
+                        best_val = training_state.metrics.get('best_val_loss', float('inf'))
+                        if best_val < float('inf'):
+                            st.metric("Best Val Loss", f"{best_val:.4f}")
+                            # Индикатор - улучшается ли модель
+                            if current_val <= best_val:
+                                st.success("⭐ Новый рекорд!")
+                            else:
+                                delta = current_val - best_val
+                                st.warning(f"📊 +{delta:.4f} от лучшего")
                         else:
-                            delta = current_val - best_val
-                            st.warning(f"📊 +{delta:.4f} от лучшего")
-                    else:
-                        st.metric("Best Val Loss", "—")
+                            st.metric("Best Val Loss", "—")
+
+            # Fuse button for MLX after training completes
+            if is_mlx and not training_state.active and training_state.metrics.get('finished'):
+                st.success(f"✅ Обучение завершено! Адаптер: `{mlx_adapter_path}`")
+                st.divider()
+                st.caption("**🔀 Слить адаптер с базовой моделью (опционально)**")
+                fuse_output = st.text_input(
+                    "Путь для сохранения слитой модели",
+                    value=f"models/{mlx_adapter_name}_fused" if mlx_adapter_path else "models/fused_model",
+                    key="mlx_fuse_output_path",
+                    help=(
+                        "Директория для сохранения модели с уже встроенными LoRA весами.\n\n"
+                        "После слияния адаптер не нужен — модель работает автономно. "
+                        "Размер увеличится (~= размер базовой модели без квантизации)."
+                    ),
+                )
+                if st.button(
+                    "🔀 Слить адаптер с моделью (Fuse)",
+                    help="Встраивает LoRA адаптер в базовую модель. Занимает ~1-3 минуты.",
+                    key="mlx_fuse_button",
+                ):
+                    with st.spinner("Слияние адаптера..."):
+                        from mlx_integration import fuse_adapter
+                        success, msg = fuse_adapter(mlx_model_id, mlx_adapter_path, fuse_output)
+                        if success:
+                            st.success(f"✅ {msg}")
+                        else:
+                            st.error(f"❌ {msg}")
             
             # Логи
             st.divider()

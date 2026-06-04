@@ -23,6 +23,7 @@ try:
         CharTokenizer as NewCharTokenizer,
         TikTokenizer,
         HybridChemTokenizer,
+        BPETokenizer,
         create_tokenizer,
         normalize_chemistry_text,
     )
@@ -32,6 +33,7 @@ except ImportError:
     NewCharTokenizer = None
     TikTokenizer = None
     HybridChemTokenizer = None
+    BPETokenizer = None
 
 
 class TextDataset(Dataset):
@@ -160,6 +162,44 @@ class CharTokenizer:
         }
 
 
+def clean_forum_noise(text: str) -> str:
+    """
+    Убирает форумный шум из текста перед обучением.
+
+    Удаляет:
+    - Паттерны "username#:" (форумные имена с решёткой-разделителем)
+    - Строки вида "username:" в начале абзаца (имена авторов)
+    - Маркеры источников "# ИСТОЧНИК: ..."
+    - Повторяющиеся пустые строки (больше двух подряд)
+
+    Это убирает ~1461 форумных префиксов и улучшает качество
+    обучающего сигнала — модель учится языку, а не структуре форума.
+    """
+    import re
+
+    # Удаляем "# ИСТОЧНИК: ..." и "---" разделители
+    text = re.sub(r'# ИСТОЧНИК: .+\n', '', text)
+    text = re.sub(r'\n---\n', '\n', text)
+
+    # Удаляем "username#:" в начале строки (форумный формат с решёткой)
+    text = re.sub(r'(?m)^[A-Za-zА-Яа-яЁё0-9 _\-]{1,40}#:', '', text)
+
+    # Удаляем "username:" в начале строки (простой формат автора)
+    # Осторожно: не трогаем "Вопрос:", "Ответ:", "Решение:" и т.п.
+    KEEP_PREFIXES = {'вопрос', 'ответ', 'решение', 'задача', 'тема', 'примечание', 'пример'}
+    def remove_username_prefix(m):
+        name = m.group(1).strip().lower()
+        if any(name.startswith(kw) for kw in KEEP_PREFIXES):
+            return m.group(0)
+        return ''
+    text = re.sub(r'(?m)^([A-Za-zА-Яа-яЁё0-9 _\-]{1,40}):\s*', remove_username_prefix, text)
+
+    # Убираем лишние пустые строки (больше 2 подряд → 2)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
+
+
 def convert_forum_json_to_text(json_path: str, include_topics: bool = True) -> str:
     """
     Конвертирует JSON файл с форумными сообщениями в текст.
@@ -189,26 +229,89 @@ def convert_forum_json_to_text(json_path: str, include_topics: bool = True) -> s
     
     messages = data.get('messages', {})
     user_id = data.get('User', 'unknown')
+    title = data.get('title', 'Тема')
     
     text_parts = []
     
     data_logger.info(f"Загрузка JSON: пользователь {user_id}")
     data_logger.info(f"JSON пользователь: {user_id}")
-    data_logger.info(f"Найдено топиков: {len(messages)}")
-    data_logger.info(f"Найдено топиков: {len(messages)}")
-    
-    total_msgs = 0
-    for topic, msgs in messages.items():
-        total_msgs += len(msgs)
-        
+    # Поддерживаем 2 распространенных формата:
+    # 1) messages: {"topic": ["msg1", "msg2"]}
+    # 2) messages: [{"author": "...", "content": "..."}, ...]
+    if isinstance(messages, dict):
+        data_logger.info(f"Найдено топиков: {len(messages)}")
+        data_logger.info(f"Найдено топиков: {len(messages)}")
+
+        total_msgs = 0
+        for topic, msgs in messages.items():
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+
+            total_msgs += len(msgs)
+
+            if include_topics:
+                text_parts.append(f"\n\n### {str(topic).strip()}\n\n")
+
+            for msg in msgs:
+                if isinstance(msg, dict):
+                    author = str(msg.get('author', '')).strip()
+                    content = str(
+                        msg.get('content')
+                        or msg.get('text')
+                        or msg.get('message')
+                        or msg.get('body')
+                        or ''
+                    ).strip()
+                    if not content:
+                        continue
+                    if author:
+                        text_parts.append(f"{author}: {content}")
+                    else:
+                        text_parts.append(content)
+                else:
+                    content = str(msg).strip()
+                    if content:
+                        text_parts.append(content)
+                text_parts.append('\n\n')
+
+    elif isinstance(messages, list):
+        data_logger.info("Найдено топиков: 1")
+        data_logger.info("Найдено топиков: 1")
+
+        total_msgs = 0
         if include_topics:
-            # Добавляем название темы как контекст
-            text_parts.append(f"\n\n### {topic}\n\n")
-        
-        # Добавляем сообщения (каждое с новой строки)
-        for msg in msgs:
-            text_parts.append(msg.strip())
+            topic_name = str(title).strip() if str(title).strip() else 'Тема'
+            text_parts.append(f"\n\n### {topic_name}\n\n")
+
+        for msg in messages:
+            if isinstance(msg, dict):
+                author = str(msg.get('author', '')).strip()
+                content = str(
+                    msg.get('content')
+                    or msg.get('text')
+                    or msg.get('message')
+                    or msg.get('body')
+                    or ''
+                ).strip()
+                if not content:
+                    continue
+                total_msgs += 1
+                if author:
+                    text_parts.append(f"{author}: {content}")
+                else:
+                    text_parts.append(content)
+            else:
+                content = str(msg).strip()
+                if not content:
+                    continue
+                total_msgs += 1
+                text_parts.append(content)
+
             text_parts.append('\n\n')
+
+    else:
+        data_logger.warning("Неожиданный тип поля 'messages', пропускаем содержимое")
+        total_msgs = 0
     
     data_logger.info(f"Всего сообщений: {total_msgs}")
     data_logger.info(f"Всего сообщений: {total_msgs}")
@@ -413,8 +516,13 @@ def load_data(
     stride: int | None = None,
     tokenizer_type: str = 'char',
     tokenizer_encoding: str = 'cl100k_base',
+    hybrid_min_token_freq: int = 2,
+    hybrid_max_domain_tokens: int = 8000,
+    bpe_vocab_size: int = 8000,
+    bpe_min_frequency: int = 2,
     tokenizer_config: dict | None = None,
-    normalize_chemistry: bool = True
+    normalize_chemistry: bool = True,
+    clean_forum: bool = False,
 ) -> tuple[DataLoader, DataLoader, object]:
     """
     Загружает данные и создаёт DataLoader'ы.
@@ -433,8 +541,12 @@ def load_data(
         train_split: Доля для train (остальное — validation)
         include_topics: Для форумного JSON — включать ли названия топиков
         stride: Шаг между окнами. Если не задан, выбирается автоматически.
-        tokenizer_type: Тип токенизатора ('char', 'tiktoken' или 'hybrid')
+        tokenizer_type: Тип токенизатора ('char', 'tiktoken', 'hybrid' или 'bpe')
         tokenizer_encoding: Для tiktoken - имя энкодера (cl100k_base, o200k_base, p50k_base)
+        hybrid_min_token_freq: Минимальная частота токена для доменного словаря hybrid
+        hybrid_max_domain_tokens: Максимум доменных токенов в hybrid словаре
+        bpe_vocab_size: Размер словаря для BPE токенизатора
+        bpe_min_frequency: Минимальная частота merge для BPE
         tokenizer_config: Конфиг токенизатора из checkpoint (для fine-tuning без пересборки vocab)
         normalize_chemistry: Нормализовать химическую запись до токенизации
     
@@ -478,6 +590,12 @@ def load_data(
     if len(text) == 0:
         raise ValueError("Пустой текст после загрузки! Проверьте содержимое файла.")
 
+    if clean_forum:
+        cleaned_text = clean_forum_noise(text)
+        if cleaned_text != text:
+            data_logger.info(f"🧹 Forum noise cleaning применена: {len(text):,} -> {len(cleaned_text):,} символов")
+        text = cleaned_text
+
     if normalize_chemistry and HAS_NEW_TOKENIZERS:
         normalized_text = normalize_chemistry_text(text)
         if normalized_text != text:
@@ -500,6 +618,10 @@ def load_data(
             tokenizer = HybridChemTokenizer.from_dict(tokenizer_config)
             data_logger.info(f"HybridTokenizer загружен из checkpoint: {tokenizer.vocab_size()} токенов")
             data_logger.info(f"Токенизатор: {tokenizer.vocab_size()} токенов (Hybrid checkpoint)")
+        elif cfg_type == 'bpe' and HAS_NEW_TOKENIZERS:
+            tokenizer = BPETokenizer.from_dict(tokenizer_config)
+            data_logger.info(f"BPETokenizer загружен из checkpoint: {tokenizer.vocab_size()} токенов")
+            data_logger.info(f"Токенизатор: {tokenizer.vocab_size()} токенов (BPE checkpoint)")
         elif cfg_type == 'char' and HAS_NEW_TOKENIZERS:
             tokenizer = NewCharTokenizer.from_dict(tokenizer_config)
             data_logger.info(f"CharTokenizer загружен из checkpoint: {tokenizer.vocab_size()} токенов (new)")
@@ -515,16 +637,34 @@ def load_data(
             tokenizer_config = None
 
     if not tokenizer_config:
-        if HAS_NEW_TOKENIZERS and tokenizer_type in ['tiktoken', 'char_new', 'hybrid']:
+        if HAS_NEW_TOKENIZERS and tokenizer_type in ['tiktoken', 'char_new', 'hybrid', 'bpe']:
             # Используем новые токенизаторы из tokenizer.py
             if tokenizer_type == 'tiktoken':
                 tokenizer = TikTokenizer(encoding_name=tokenizer_encoding)
                 data_logger.info(f"TikTokenizer создан: {tokenizer.vocab_size()} токенов ({tokenizer_encoding})")
                 data_logger.info(f"Токенизатор: {tokenizer.vocab_size()} токенов (TikToken {tokenizer_encoding})")
             elif tokenizer_type == 'hybrid':
-                tokenizer = HybridChemTokenizer.from_text(text)
-                data_logger.info(f"HybridTokenizer создан: {tokenizer.vocab_size()} токенов")
+                tokenizer = HybridChemTokenizer.from_text(
+                    text,
+                    min_token_freq=hybrid_min_token_freq,
+                    max_domain_tokens=hybrid_max_domain_tokens,
+                )
+                data_logger.info(
+                    f"HybridTokenizer создан: {tokenizer.vocab_size()} токенов "
+                    f"(min_freq={hybrid_min_token_freq}, max_domain_tokens={hybrid_max_domain_tokens})"
+                )
                 data_logger.info(f"Токенизатор: {tokenizer.vocab_size()} токенов (Hybrid)")
+            elif tokenizer_type == 'bpe':
+                tokenizer = BPETokenizer.from_text(
+                    text,
+                    vocab_size=bpe_vocab_size,
+                    min_frequency=bpe_min_frequency,
+                )
+                data_logger.info(
+                    f"BPETokenizer создан: {tokenizer.vocab_size()} токенов "
+                    f"(target_vocab_size={bpe_vocab_size}, min_freq={bpe_min_frequency})"
+                )
+                data_logger.info(f"Токенизатор: {tokenizer.vocab_size()} токенов (BPE)")
             else:  # char_new
                 tokenizer = NewCharTokenizer.from_text(text)
                 data_logger.info(f"CharTokenizer создан: {tokenizer.vocab_size()} токенов (new)")

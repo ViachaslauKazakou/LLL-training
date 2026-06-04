@@ -14,6 +14,18 @@ import re
 from collections import Counter
 import tiktoken
 
+try:
+    from tokenizers import Tokenizer as HFTokenizer
+    from tokenizers import models, trainers, pre_tokenizers, decoders
+    HAS_HF_TOKENIZERS = True
+except ImportError:
+    HFTokenizer = None
+    models = None
+    trainers = None
+    pre_tokenizers = None
+    decoders = None
+    HAS_HF_TOKENIZERS = False
+
 from logger import data_logger
 
 
@@ -278,7 +290,7 @@ class HybridChemTokenizer:
         re.UNICODE,
     )
 
-    def __init__(self, vocab: List[str], min_token_freq: int = 2, max_domain_tokens: int = 2000):
+    def __init__(self, vocab: List[str], min_token_freq: int = 2, max_domain_tokens: int = 8000):
         self.vocab = vocab
         self.token_to_idx = {token: idx for idx, token in enumerate(vocab)}
         self.idx_to_token = {idx: token for token, idx in self.token_to_idx.items()}
@@ -301,7 +313,7 @@ class HybridChemTokenizer:
         cls,
         text: str,
         min_token_freq: int = 2,
-        max_domain_tokens: int = 2000,
+        max_domain_tokens: int = 8000,
     ) -> 'HybridChemTokenizer':
         special_tokens = ['<pad>', '<unk>', '<bos>', '<eos>']
         tokens = cls.TOKEN_PATTERN.findall(text)
@@ -366,21 +378,137 @@ class HybridChemTokenizer:
         return HybridChemTokenizer(
             vocab=data['vocab'],
             min_token_freq=data.get('min_token_freq', 2),
-            max_domain_tokens=data.get('max_domain_tokens', 2000),
+            max_domain_tokens=data.get('max_domain_tokens', 8000),
+        )
+
+
+class BPETokenizer:
+    """
+    Обучаемый BPE-токенизатор на базе HuggingFace tokenizers.
+
+    Поддерживает:
+    - настройку размера словаря (например 4k-16k)
+    - сериализацию/десериализацию в checkpoint
+    - fallback через ImportError, если библиотека tokenizers не установлена
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        vocab_size: int,
+        min_frequency: int,
+        special_tokens: Optional[List[str]] = None,
+    ):
+        if not HAS_HF_TOKENIZERS:
+            raise ImportError("BPETokenizer требует библиотеку 'tokenizers'. Установите: poetry add tokenizers")
+
+        self.tokenizer = tokenizer
+        self.requested_vocab_size = vocab_size
+        self.min_frequency = min_frequency
+        self.special_tokens = special_tokens or ['<pad>', '<unk>', '<bos>', '<eos>']
+
+        self.pad_token = '<pad>'
+        self.unk_token = '<unk>'
+        self.bos_token = '<bos>'
+        self.eos_token = '<eos>'
+
+        self.pad_id = self.tokenizer.token_to_id(self.pad_token)
+        self.unk_id = self.tokenizer.token_to_id(self.unk_token)
+        self.bos_id = self.tokenizer.token_to_id(self.bos_token)
+        self.eos_id = self.tokenizer.token_to_id(self.eos_token)
+
+    @classmethod
+    def from_text(
+        cls,
+        text: str,
+        vocab_size: int = 8000,
+        min_frequency: int = 2,
+    ) -> 'BPETokenizer':
+        if not HAS_HF_TOKENIZERS:
+            raise ImportError("BPETokenizer требует библиотеку 'tokenizers'. Установите: poetry add tokenizers")
+
+        special_tokens = ['<pad>', '<unk>', '<bos>', '<eos>']
+
+        tokenizer = HFTokenizer(models.BPE(unk_token='<unk>'))
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = decoders.ByteLevel()
+
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            min_frequency=min_frequency,
+            special_tokens=special_tokens,
+        )
+
+        tokenizer.train_from_iterator([text], trainer=trainer)
+
+        return cls(
+            tokenizer=tokenizer,
+            vocab_size=vocab_size,
+            min_frequency=min_frequency,
+            special_tokens=special_tokens,
+        )
+
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> List[int]:
+        encoding = self.tokenizer.encode(text)
+        ids = encoding.ids
+
+        if add_bos:
+            ids = [self.bos_id] + ids
+        if add_eos:
+            ids = ids + [self.eos_id]
+
+        return ids
+
+    def decode(self, indices: List[int], skip_special_tokens: bool = True) -> str:
+        if skip_special_tokens:
+            special_ids = {self.pad_id, self.unk_id, self.bos_id, self.eos_id}
+            indices = [idx for idx in indices if idx not in special_ids]
+
+        return self.tokenizer.decode(indices)
+
+    def vocab_size(self) -> int:
+        return self.tokenizer.get_vocab_size()
+
+    def to_dict(self) -> Dict:
+        return {
+            'type': 'bpe',
+            'tokenizer_json': self.tokenizer.to_str(),
+            'vocab_size': self.requested_vocab_size,
+            'min_frequency': self.min_frequency,
+            'special_tokens': self.special_tokens,
+        }
+
+    @staticmethod
+    def from_dict(data: Dict) -> 'BPETokenizer':
+        if not HAS_HF_TOKENIZERS:
+            raise ImportError("BPETokenizer требует библиотеку 'tokenizers'. Установите: poetry add tokenizers")
+
+        tokenizer_json = data.get('tokenizer_json')
+        if not tokenizer_json:
+            raise ValueError("Некорректный BPE tokenizer_config: отсутствует tokenizer_json")
+
+        tokenizer = HFTokenizer.from_str(tokenizer_json)
+        return BPETokenizer(
+            tokenizer=tokenizer,
+            vocab_size=data.get('vocab_size', tokenizer.get_vocab_size()),
+            min_frequency=data.get('min_frequency', 2),
+            special_tokens=data.get('special_tokens', ['<pad>', '<unk>', '<bos>', '<eos>']),
         )
 
 
 def create_tokenizer(
     text: str, 
     tokenizer_type: str = 'tiktoken',
-    encoding_name: str = 'cl100k_base'
+    encoding_name: str = 'cl100k_base',
+    bpe_vocab_size: int = 8000,
+    bpe_min_frequency: int = 2,
 ):
     """
     Фабричный метод: создаёт токенизатор нужного типа.
     
     Args:
         text: обучающий текст (используется только для char)
-        tokenizer_type: 'char', 'tiktoken' или 'hybrid'
+        tokenizer_type: 'char', 'tiktoken', 'hybrid' или 'bpe'
         encoding_name: для tiktoken - имя энкодера (cl100k_base, o200k_base, p50k_base)
     
     Returns:
@@ -392,8 +520,14 @@ def create_tokenizer(
         return TikTokenizer(encoding_name=encoding_name)
     elif tokenizer_type == 'hybrid':
         return HybridChemTokenizer.from_text(text)
+    elif tokenizer_type == 'bpe':
+        return BPETokenizer.from_text(
+            text,
+            vocab_size=bpe_vocab_size,
+            min_frequency=bpe_min_frequency,
+        )
     else:
-        raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}. Use 'char', 'tiktoken' or 'hybrid'")
+        raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}. Use 'char', 'tiktoken', 'hybrid' or 'bpe'")
 
 
 if __name__ == '__main__':

@@ -196,41 +196,56 @@ class GPTModel(nn.Module):
         input_ids: torch.Tensor,
         max_new_tokens: int = 50,
         temperature: float = 1.0,
-        top_k: int | None = None
+        top_k: int | None = None,
+        top_p: float | None = None,
     ) -> torch.Tensor:
         """
         Авторегрессионная генерация.
-        
+
         input_ids: (batch, seq_len) — начальная последовательность
         max_new_tokens: сколько новых токенов сгенерировать
         temperature: > 1 = более случайно, < 1 = более детерминированно
         top_k: если задано, выбирать только из top-k токенов
-        
+        top_p: nucleus sampling — выбирать из минимального набора токенов,
+               чья суммарная вероятность >= top_p (0.9 — хороший дефолт)
+
         Returns: (batch, seq_len + max_new_tokens)
         """
         for _ in range(max_new_tokens):
             # Обрезаем если длина превышает context_len
             input_ids_cond = input_ids if input_ids.size(1) <= self.config.context_len \
                              else input_ids[:, -self.config.context_len:]
-            
+
             # Forward pass
             logits, _ = self(input_ids_cond)
-            
+
             # Берём logits последнего токена  →  (batch, vocab_size)
             logits = logits[:, -1, :] / temperature
-            
+
             # Top-k filtering
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
-            
+
             # Softmax → вероятности
             probs = nn.functional.softmax(logits, dim=-1)
-            
+
+            # Nucleus (top-p) filtering
+            if top_p is not None:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                # Убираем токены за пределами ядра (cumsum - prob > top_p)
+                sorted_mask = (cumulative_probs - sorted_probs) > top_p
+                sorted_probs[sorted_mask] = 0.0
+                # Возвращаем к исходному порядку
+                probs = torch.zeros_like(probs).scatter_(1, sorted_indices, sorted_probs)
+                probs_sum = probs.sum(dim=-1, keepdim=True)
+                probs = probs / probs_sum.clamp(min=1e-8)
+
             # Сэмплируем следующий токен
             next_token = torch.multinomial(probs, num_samples=1)  # (batch, 1)
-            
+
             # Добавляем к последовательности
             input_ids = torch.cat([input_ids, next_token], dim=1)
-        
+
         return input_ids
