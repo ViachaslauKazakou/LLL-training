@@ -24,7 +24,7 @@
             },
             "envFile": "${workspaceFolder}/src/settings/resources/.env.dev",
             "justMyCode": true,
-            "python": "${command:python.interpreterPath}",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "jinja": true
         },
 

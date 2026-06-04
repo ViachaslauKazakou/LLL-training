@@ -47,3 +47,7 @@ Thumbs.db
 # Логи
 *.log
 logs/*.log
+
+# Local trained/fused artifacts (never commit)
+models/**
+adapters/**

@@ -44,8 +44,12 @@ class TrainingState:
         'progress': 0.0
     })
 
-# Создаём глобальный объект состояния
-training_state = TrainingState()
+@st.cache_resource
+def _get_training_state() -> TrainingState:
+    return TrainingState()
+
+# Синглтон — один объект на всё время жизни сервера, переживает reruns
+training_state = _get_training_state()
 
 
 # Конфигурация страницы
@@ -428,20 +432,39 @@ def tab_generation():
         if not MLX_AVAILABLE:
             st.error("❌ mlx-lm не установлен. Выполните: `poetry add mlx-lm`")
         else:
-            mlx_gen_model_labels = [get_model_display_label(m) for m in CURATED_MODELS]
+            # Local fused models from models/ directory
+            _models_dir = Path(__file__).parent / "models"
+            _local_models = []
+            if _models_dir.exists():
+                _local_models = [
+                    d for d in sorted(_models_dir.iterdir())
+                    if d.is_dir() and (d / "config.json").exists()
+                ]
+
+            # Build combined options: local models first, then curated HF models
+            _local_labels = [f"📁 {d.name}" for d in _local_models]
+            _hf_labels = [get_model_display_label(m) for m in CURATED_MODELS]
+            _all_labels = _local_labels + _hf_labels
+
             mlx_gen_selected_label = st.selectbox(
                 "Модель",
-                mlx_gen_model_labels,
+                _all_labels,
                 index=0,
                 key="mlx_gen_model_select",
+                help="📁 = локальная слитая модель | ✅/⬇️ = HF модель из кеша/для скачивания",
             )
-            mlx_gen_model_idx = mlx_gen_model_labels.index(mlx_gen_selected_label)
-            mlx_gen_model_id = CURATED_MODELS[mlx_gen_model_idx].hf_id
 
-            use_custom_gen_id = st.checkbox("Свой HF ID", key="mlx_gen_custom_id")
+            _sel_idx = _all_labels.index(mlx_gen_selected_label)
+            if _sel_idx < len(_local_models):
+                mlx_gen_model_id = str(_local_models[_sel_idx])
+                st.caption(f"📁 `{mlx_gen_model_id}`")
+            else:
+                mlx_gen_model_id = CURATED_MODELS[_sel_idx - len(_local_models)].hf_id
+
+            use_custom_gen_id = st.checkbox("Свой HF ID или путь", key="mlx_gen_custom_id")
             if use_custom_gen_id:
                 mlx_gen_model_id = st.text_input(
-                    "HuggingFace model ID",
+                    "HuggingFace model ID или локальный путь",
                     value=mlx_gen_model_id,
                     key="mlx_gen_model_id_input",
                 )
@@ -514,6 +537,16 @@ def tab_generation():
                 ),
             )
 
+            mlx_gen_use_chat_template = st.checkbox(
+                "Применять chat template",
+                value=True,
+                key="mlx_gen_use_chat_template",
+                help=(
+                    "Включено — оборачивает промпт в формат модели (нужно для Instruct/Chat моделей).\n\n"
+                    "Выключи для base моделей или если хочешь передать промпт напрямую."
+                ),
+            )
+
             if st.button("✨ Сгенерировать (MLX)", type="primary", width="stretch", key="mlx_gen_btn"):
                 if not mlx_gen_prompt.strip():
                     st.warning("Введите промпт!")
@@ -545,6 +578,7 @@ def tab_generation():
                                 top_p=mlx_gen_top_p,
                                 repetition_penalty=mlx_gen_rep_penalty,
                                 system_prompt=mlx_gen_system_prompt,
+                                use_chat_template=mlx_gen_use_chat_template,
                             )
                             st.success("✅ Готово!")
                             sc1, sc2, sc3, sc4 = st.columns(4)
@@ -853,6 +887,7 @@ def tab_training():
         mlx_format = "completion"
         mlx_system_prompt = ""
         mlx_clean_forum_data = False
+        mlx_resume_adapter = None
 
         if is_mlx:
             from mlx_integration import (
@@ -871,27 +906,41 @@ def tab_training():
 
                 # --- Выбор базовой модели ---
                 st.markdown("**🤖 Базовая модель**")
-                model_labels = [get_model_display_label(m) for m in CURATED_MODELS]
+
+                # Локальные модели из models/
+                _train_models_dir = Path(__file__).parent / "models"
+                _local_train_models = sorted([
+                    d for d in _train_models_dir.iterdir()
+                    if d.is_dir() and (d / "config.json").exists()
+                ]) if _train_models_dir.exists() else []
+
+                _local_train_labels = [f"📁 {d.name}" for d in _local_train_models]
+                _hf_train_labels = [get_model_display_label(m) for m in CURATED_MODELS]
+                _all_train_labels = _local_train_labels + _hf_train_labels
+
                 selected_model_label = st.selectbox(
                     "Выберите модель",
-                    model_labels,
+                    _all_train_labels,
                     index=0,
                     disabled=training_state.active,
                     help=(
-                        "Предобученная модель из mlx-community на HuggingFace.\n\n"
-                        "✅ = уже скачана в кеш (~/.cache/huggingface/)\n"
-                        "⬇️ = будет скачана при запуске (может занять несколько минут)\n\n"
+                        "📁 = локальная модель из папки models/ (слитая или дообученная)\n\n"
+                        "✅ = HF модель уже в кеше | ⬇️ = будет скачана при запуске\n\n"
                         "Рекомендации:\n"
                         "• Qwen2.5 1.5B или SmolLM2 1.7B — лучший баланс для форумных данных\n"
                         "• Llama 3.2 1B — самый лёгкий вариант (~700 MB)\n"
                         "• Модели 3B+ — лучшее качество, но больше памяти"
                     ),
                 )
-                selected_model_idx = model_labels.index(selected_model_label)
-                selected_model = CURATED_MODELS[selected_model_idx]
-                mlx_model_id = selected_model.hf_id
-                st.caption(f"📋 {selected_model.description}")
-                st.caption(f"🔗 HF ID: `{mlx_model_id}` | Контекст: {selected_model.context_length:,} токенов")
+                _sel_train_idx = _all_train_labels.index(selected_model_label)
+                if _sel_train_idx < len(_local_train_models):
+                    mlx_model_id = str(_local_train_models[_sel_train_idx])
+                    st.caption(f"📁 Локальная модель: `{mlx_model_id}`")
+                else:
+                    selected_model = CURATED_MODELS[_sel_train_idx - len(_local_train_models)]
+                    mlx_model_id = selected_model.hf_id
+                    st.caption(f"📋 {selected_model.description}")
+                    st.caption(f"🔗 HF ID: `{mlx_model_id}` | Контекст: {selected_model.context_length:,} токенов")
 
                 use_custom_id = st.checkbox(
                     "Использовать свой HuggingFace ID",
@@ -1178,6 +1227,41 @@ def tab_training():
                     ),
                 )
                 mlx_adapter_path = str(Path(__file__).parent / "adapters" / mlx_adapter_name) if mlx_adapter_name else None
+
+                # --- Продолжить с существующего адаптера ---
+                _adapters_dir = Path(__file__).parent / "adapters"
+                _existing_adapters = [
+                    d for d in sorted(_adapters_dir.iterdir())
+                    if d.is_dir() and any(d.glob("*.safetensors"))
+                ] if _adapters_dir.exists() else []
+
+                mlx_resume_adapter = None
+                if _existing_adapters:
+                    mlx_resume = st.checkbox(
+                        "Продолжить обучение с существующего адаптера",
+                        value=False,
+                        disabled=training_state.active,
+                        key="mlx_resume_check",
+                        help=(
+                            "Загружает веса из уже обученного адаптера и продолжает обучение.\n\n"
+                            "Используй если:\n"
+                            "• Обучение прервалось и хочешь продолжить\n"
+                            "• Хочешь дообучить адаптер на новых данных"
+                        ),
+                    )
+                    if mlx_resume:
+                        _adapter_options = [d.name for d in _existing_adapters]
+                        _selected_resume = st.selectbox(
+                            "Адаптер для продолжения",
+                            _adapter_options,
+                            disabled=training_state.active,
+                            key="mlx_resume_adapter_select",
+                        )
+                        _resume_dir = _adapters_dir / _selected_resume
+                        _safetensors = list(_resume_dir.glob("*.safetensors"))
+                        if _safetensors:
+                            mlx_resume_adapter = str(_safetensors[0])
+                            st.caption(f"📂 Продолжение с: `{mlx_resume_adapter}`")
 
         # Выбор checkpoint для дообучения
         checkpoint_to_load = None
@@ -2029,10 +2113,14 @@ def tab_training():
                 'progress': 0.0
             }
             
-            app_logger.info(f"UI Обучение запущено: mode={'fine-tuning' if is_finetuning else 'from scratch'}")
-            if is_finetuning:
-                app_logger.info(f"UI Checkpoint для дообучения: {checkpoint_to_load}")
-            app_logger.info(f"UI Параметры: epochs={epochs}, batch_size={batch_size}, lr={lr}, data={data_path}")
+            if is_mlx:
+                app_logger.info("UI Обучение запущено: mode=MLX Fine-tuning")
+                app_logger.info(f"UI MLX Параметры: model={mlx_model_id}, iters={mlx_iters}, batch={mlx_batch_size_val}, lr={mlx_lr}, data={mlx_data_dir}")
+            else:
+                app_logger.info(f"UI Обучение запущено: mode={'fine-tuning' if is_finetuning else 'from scratch'}")
+                if is_finetuning:
+                    app_logger.info(f"UI Checkpoint для дообучения: {checkpoint_to_load}")
+                app_logger.info(f"UI Параметры: epochs={epochs}, batch_size={batch_size}, lr={lr}, data={data_path}")
             
             # Запускаем обучение в отдельном потоке
             def run_training():
@@ -2057,6 +2145,7 @@ def tab_training():
                         steps_per_eval=mlx_steps_per_eval,
                         save_every=mlx_save_every,
                         grad_checkpoint=mlx_grad_checkpoint,
+                        resume_adapter_file=mlx_resume_adapter,
                     )
                     run_mlx_training(config, training_state)
                     return  # run_mlx_training manages its own thread + training_state
@@ -2953,7 +3042,43 @@ def tab_info():
     """)
     
     st.divider()
-    
+
+    # Управление скачанными моделями HF
+    st.subheader("🗂️ Скачанные модели HF")
+    _hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    _cached = sorted([d for d in _hf_cache.iterdir() if d.is_dir() and d.name.startswith("models--")]) if _hf_cache.exists() else []
+
+    if not _cached:
+        st.info("Нет скачанных моделей в ~/.cache/huggingface/hub/")
+    else:
+        for _model_dir in _cached:
+            _display_name = _model_dir.name.replace("models--", "").replace("--", "/")
+            _size_bytes = sum(f.stat().st_size for f in _model_dir.rglob("*") if f.is_file())
+            _size_gb = _size_bytes / 1024**3
+            _col1, _col2 = st.columns([4, 1])
+            with _col1:
+                st.text(f"📦 {_display_name}  ({_size_gb:.2f} GB)")
+            with _col2:
+                if st.button("🗑️ Удалить", key=f"del_{_model_dir.name}"):
+                    st.session_state[f"confirm_del_{_model_dir.name}"] = True
+
+            if st.session_state.get(f"confirm_del_{_model_dir.name}"):
+                st.warning(f"Удалить **{_display_name}** ({_size_gb:.2f} GB)?")
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    if st.button("✅ Да, удалить", key=f"yes_{_model_dir.name}"):
+                        import shutil
+                        shutil.rmtree(_model_dir)
+                        st.session_state.pop(f"confirm_del_{_model_dir.name}", None)
+                        st.success(f"Удалено: {_display_name}")
+                        st.rerun()
+                with _c2:
+                    if st.button("❌ Отмена", key=f"no_{_model_dir.name}"):
+                        st.session_state.pop(f"confirm_del_{_model_dir.name}", None)
+                        st.rerun()
+
+    st.divider()
+
     # System info
     st.subheader("💻 Системная информация")
     

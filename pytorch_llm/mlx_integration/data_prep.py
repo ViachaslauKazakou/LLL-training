@@ -33,13 +33,62 @@ def _clean_forum_text(text: str) -> str:
     return text.strip()
 
 
+def _estimate_tokens(text: str) -> int:
+    """Консервативная оценка числа токенов (для русского ~4 символа/токен)."""
+    return len(text) // 4
+
+
+def _split_by_sentences(text: str, max_seq_length: int) -> list[str]:
+    """Разбивает текст по предложениям когда абзац слишком длинный."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current: list[str] = []
+    current_len = 0
+
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        sent_tokens = _estimate_tokens(sent)
+
+        # Одно предложение само по себе слишком длинное — режем по словам
+        if sent_tokens > max_seq_length:
+            if current:
+                chunks.append(" ".join(current))
+                current, current_len = [], 0
+            words = sent.split()
+            part: list[str] = []
+            part_len = 0
+            for word in words:
+                wt = _estimate_tokens(word)
+                if part_len + wt > max_seq_length and part:
+                    chunks.append(" ".join(part))
+                    part, part_len = [], 0
+                part.append(word)
+                part_len += wt
+            if part:
+                chunks.append(" ".join(part))
+            continue
+
+        if current_len + sent_tokens > max_seq_length and current:
+            chunks.append(" ".join(current))
+            current, current_len = [], 0
+
+        current.append(sent)
+        current_len += sent_tokens
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks
+
+
 def _split_text_into_chunks(text: str, max_seq_length: int) -> list[str]:
     """Разбивает текст на чанки по абзацам/предложениям с учётом max_seq_length."""
-    # Разбиваем по двойным переносам (абзацы)
     paragraphs = re.split(r'\n\n+', text)
 
-    chunks = []
-    current_chunk = []
+    chunks: list[str] = []
+    current: list[str] = []
     current_len = 0
 
     for para in paragraphs:
@@ -47,23 +96,25 @@ def _split_text_into_chunks(text: str, max_seq_length: int) -> list[str]:
         if not para:
             continue
 
-        # Грубая оценка: 1 токен ≈ 3-4 символа
-        para_tokens = len(para) // 3
+        para_tokens = _estimate_tokens(para)
 
-        if current_len + para_tokens > max_seq_length and current_chunk:
-            chunk_text = "\n\n".join(current_chunk)
-            if len(chunk_text) >= 20:
-                chunks.append(chunk_text)
-            current_chunk = [para]
-            current_len = para_tokens
-        else:
-            current_chunk.append(para)
-            current_len += para_tokens
+        # Абзац сам по себе слишком длинный — дробим по предложениям
+        if para_tokens > max_seq_length:
+            if current:
+                chunks.append("\n\n".join(current))
+                current, current_len = [], 0
+            chunks.extend(_split_by_sentences(para, max_seq_length))
+            continue
 
-    if current_chunk:
-        chunk_text = "\n\n".join(current_chunk)
-        if len(chunk_text) >= 20:
-            chunks.append(chunk_text)
+        if current_len + para_tokens > max_seq_length and current:
+            chunks.append("\n\n".join(current))
+            current, current_len = [], 0
+
+        current.append(para)
+        current_len += para_tokens
+
+    if current:
+        chunks.append("\n\n".join(current))
 
     return chunks
 

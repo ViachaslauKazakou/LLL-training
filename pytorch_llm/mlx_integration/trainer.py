@@ -4,12 +4,19 @@ trainer.py — запуск MLX LoRA fine-tuning через subprocess.
 Ответственность: только управление процессом обучения.
 """
 
+import logging
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import yaml
+
+# Используем training_logger если он уже настроен в logger.py, иначе стандартный
+_logger = logging.getLogger("pytorch_llm.training")
 
 
 @dataclass
@@ -31,6 +38,7 @@ class MLXTrainingConfig:
     steps_per_eval: int = 100
     save_every: int = 100
     grad_checkpoint: bool = False
+    resume_adapter_file: str | None = None  # путь к .safetensors для продолжения
 
 
 # Regex паттерны для парсинга stdout mlx-lm
@@ -85,16 +93,29 @@ def run_mlx_training(config: MLXTrainingConfig, training_state) -> None:
     adapter_path = Path(config.adapter_path)
     adapter_path.mkdir(parents=True, exist_ok=True)
 
+    # Write LoRA params to a temp config YAML (--lora-parameters is not a valid CLI arg)
+    lora_config = {
+        "lora_parameters": {
+            "rank": config.lora_rank,
+            "scale": config.lora_scale,
+            "dropout": config.lora_dropout,
+        }
+    }
+    config_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, dir=adapter_path
+    )
+    yaml.dump(lora_config, config_file)
+    config_file.flush()
+    config_file.close()
+
     cmd = [
-        sys.executable, "-m", "mlx_lm.lora",
+        sys.executable, "-m", "mlx_lm", "lora",
         "--model", config.model_id,
         "--train",
         "--data", config.data_dir,
         "--adapter-path", config.adapter_path,
         "--num-layers", str(config.lora_layers),
-        "--lora-parameters", f"rank={config.lora_rank}",
-        "--lora-parameters", f"scale={config.lora_scale}",
-        "--lora-parameters", f"dropout={config.lora_dropout}",
+        "-c", config_file.name,
         "--learning-rate", str(config.learning_rate),
         "--batch-size", str(config.batch_size),
         "--iters", str(config.iters),
@@ -107,14 +128,21 @@ def run_mlx_training(config: MLXTrainingConfig, training_state) -> None:
     if config.grad_checkpoint:
         cmd.append("--grad-checkpoint")
 
+    if config.resume_adapter_file:
+        cmd += ["--resume-adapter-file", config.resume_adapter_file]
+
+    def _log(msg: str):
+        training_state.logs.append(msg)
+        _logger.info(msg)
+
     def _run():
         training_state.active = True
-        training_state.logs.append(f"Запуск MLX LoRA fine-tuning...")
-        training_state.logs.append(f"Модель: {config.model_id}")
-        training_state.logs.append(f"Адаптер: {config.adapter_path}")
-        training_state.logs.append(f"Данные: {config.data_dir}")
-        training_state.logs.append(f"Итераций: {config.iters}, batch={config.batch_size}, lr={config.learning_rate}")
-        training_state.logs.append("─" * 50)
+        _log("Запуск MLX LoRA fine-tuning...")
+        _log(f"Модель: {config.model_id}")
+        _log(f"Адаптер: {config.adapter_path}")
+        _log(f"Данные: {config.data_dir}")
+        _log(f"Итераций: {config.iters}, batch={config.batch_size}, lr={config.learning_rate}")
+        _log("─" * 50)
 
         try:
             process = subprocess.Popen(
@@ -136,6 +164,7 @@ def run_mlx_training(config: MLXTrainingConfig, training_state) -> None:
                     continue
 
                 training_state.logs.append(line)
+                _logger.info(line)
 
                 # Парсим метрики
                 parsed = _parse_mlx_line(line)
@@ -156,17 +185,17 @@ def run_mlx_training(config: MLXTrainingConfig, training_state) -> None:
             retcode = process.returncode
 
             if retcode == 0:
-                training_state.logs.append("─" * 50)
-                training_state.logs.append("✅ Обучение завершено успешно!")
-                training_state.logs.append(f"Адаптеры сохранены в: {config.adapter_path}")
+                _log("─" * 50)
+                _log("✅ Обучение завершено успешно!")
+                _log(f"Адаптеры сохранены в: {config.adapter_path}")
                 training_state.metrics["finished"] = True
                 training_state.metrics["progress"] = 1.0
             else:
-                training_state.logs.append(f"❌ Процесс завершился с кодом {retcode}")
+                _log(f"❌ Процесс завершился с кодом {retcode}")
                 training_state.metrics["error"] = f"Exit code: {retcode}"
 
         except Exception as e:
-            training_state.logs.append(f"❌ Ошибка запуска: {e}")
+            _log(f"❌ Ошибка запуска: {e}")
             training_state.metrics["error"] = str(e)
         finally:
             training_state.active = False
@@ -190,7 +219,7 @@ def fuse_adapter(model_id: str, adapter_path: str, output_path: str) -> tuple[bo
         "--model", model_id,
         "--adapter-path", adapter_path,
         "--save-path", output_path,
-        "--de-quantize",
+        "--dequantize",
     ]
 
     try:
