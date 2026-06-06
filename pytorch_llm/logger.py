@@ -123,6 +123,17 @@ def log_session_end(logger: logging.Logger, module_name: str):
     logger.info("=" * 60 + "\n")
 
 
+# Фильтруем конкретный мусор из transformers, не меняя уровень логирования
+class _TransformersNoiseFilter(logging.Filter):
+    """Блокирует шумные __path__ warnings от lazy-модулей transformers."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "__path__" not in record.getMessage()
+
+_trf_filter = _TransformersNoiseFilter()
+for _lib in ["transformers", "transformers.utils", "transformers.utils.import_utils"]:
+    logging.getLogger(_lib).addFilter(_trf_filter)
+
+
 # Пример использования:
 # from logger import data_logger, log_session_start, log_session_end
 #
