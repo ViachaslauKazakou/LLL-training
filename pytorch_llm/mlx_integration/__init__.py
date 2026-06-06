@@ -14,7 +14,10 @@ try:
 except ImportError:
     MLX_AVAILABLE = False
 
-from .models_registry import CURATED_MODELS, ModelInfo, is_model_cached, get_model_display_label
+from .models_registry import (
+    CURATED_MODELS, ModelInfo, is_model_cached, get_model_display_label,
+    load_user_models, save_user_model, remove_user_model,
+)
 from .data_prep import DataPrepConfig, prepare_mlx_dataset
 from .trainer import MLXTrainingConfig, run_mlx_training, fuse_adapter
 from .inference import load_mlx_model, mlx_generate

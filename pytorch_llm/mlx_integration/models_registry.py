@@ -4,8 +4,12 @@ models_registry.py — реестр предобученных моделей д
 Ответственность: только метаданные моделей.
 """
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, asdict
 from pathlib import Path
+
+# Файл с пользовательскими моделями
+_USER_MODELS_FILE = Path(__file__).parent.parent / "data" / "user_models.json"
 
 
 @dataclass
@@ -84,6 +88,51 @@ CURATED_MODELS: list[ModelInfo] = [
         context_length=131072,
     ),
 ]
+
+
+def load_user_models() -> list[ModelInfo]:
+    """Загружает пользовательские модели из JSON файла."""
+    if not _USER_MODELS_FILE.exists():
+        return []
+    try:
+        data = json.loads(_USER_MODELS_FILE.read_text(encoding="utf-8"))
+        return [ModelInfo(**m) for m in data]
+    except Exception:
+        return []
+
+
+def save_user_model(hf_id: str, name: str = "", description: str = "") -> ModelInfo:
+    """Добавляет модель в пользовательский список и сохраняет."""
+    _USER_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    models = load_user_models()
+
+    # Не дублировать
+    if any(m.hf_id == hf_id for m in models):
+        return next(m for m in models if m.hf_id == hf_id)
+
+    model = ModelInfo(
+        name=name or hf_id.split("/")[-1],
+        hf_id=hf_id,
+        size_gb=0.0,
+        params_label="?",
+        description=description or f"Пользовательская модель: {hf_id}",
+        context_length=0,
+    )
+    models.append(model)
+    _USER_MODELS_FILE.write_text(
+        json.dumps([asdict(m) for m in models], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return model
+
+
+def remove_user_model(hf_id: str) -> None:
+    """Удаляет модель из пользовательского списка."""
+    models = [m for m in load_user_models() if m.hf_id != hf_id]
+    _USER_MODELS_FILE.write_text(
+        json.dumps([asdict(m) for m in models], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def is_model_cached(hf_id: str) -> bool:
